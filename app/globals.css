@@ -1,0 +1,74 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import "leaflet/dist/leaflet.css";
+@import "leaflet.markercluster/dist/MarkerCluster.css";
+@import "leaflet.markercluster/dist/MarkerCluster.Default.css";
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: #faf7f2;
+  color: theme("colors.ink.900");
+  font-family: theme("fontFamily.sans");
+  -webkit-font-smoothing: antialiased;
+}
+
+#__next,
+main {
+  height: 100%;
+}
+
+/* Leaflet marker container — let our SVG icons render natively */
+.ff-marker {
+  background: transparent !important;
+  border: none !important;
+}
+
+.ff-marker svg {
+  display: block;
+  filter: drop-shadow(1px 2px 0 rgba(15, 18, 24, 0.18));
+}
+
+/* MarkerCluster — sketch-styled override */
+.marker-cluster-small,
+.marker-cluster-medium,
+.marker-cluster-large {
+  background: rgba(255, 245, 240, 0.85) !important;
+}
+.marker-cluster-small div,
+.marker-cluster-medium div,
+.marker-cluster-large div {
+  background: #ff7a59 !important;
+  color: #fff !important;
+  font-family: theme("fontFamily.sketch") !important;
+  font-weight: 700;
+  border: 2px solid #0f1218;
+  box-shadow: 2px 2px 0 rgba(15, 18, 24, 0.18);
+}
+
+/* Popup */
+.leaflet-popup-content-wrapper {
+  border-radius: 14px;
+  border: 2px solid theme("colors.ink.900");
+  box-shadow: theme("boxShadow.sketch");
+  padding: 4px 6px;
+}
+.leaflet-popup-content {
+  margin: 12px 14px;
+  font-family: theme("fontFamily.sans");
+  line-height: 1.5;
+}
+.leaflet-popup-tip {
+  border: 2px solid theme("colors.ink.900");
+}

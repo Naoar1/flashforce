@@ -1,0 +1,19 @@
+{
+  "name": "FlashForce — 全台科技執法・測速地圖",
+  "short_name": "FlashForce",
+  "description": "全台固定測速、科技執法與機動測速點地圖",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#faf7f2",
+  "theme_color": "#ff5c33",
+  "lang": "zh-Hant-TW",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

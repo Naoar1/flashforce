@@ -1,0 +1,40 @@
+name: Weekly data scrape
+
+on:
+  schedule:
+    # 每週日台灣時間 04:00 (UTC 20:00 週六)
+    - cron: "0 20 * * 6"
+  workflow_dispatch: # 手動觸發
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: Run scrapers
+        run: npm run scrape:all
+
+      - name: Commit data update
+        run: |
+          git config user.name "flashforce-bot"
+          git config user.email "flashforce-bot@users.noreply.github.com"
+          if git diff --quiet -- public/data/data.json; then
+            echo "No data changes."
+            exit 0
+          fi
+          git add public/data/data.json
+          git commit -m "data: weekly auto-update $(date -u +%Y-%m-%d)"
+          git push
