@@ -93,6 +93,18 @@ export interface NTPCRow {
 }
 
 /**
+ * Detect 區間測速 patterns in an address. The 全國 7320 dataset doesn't
+ * distinguish 區間 from 點測速; we infer from a "<num>K ... 至 ... <num>K"
+ * shape (handles K/k, +Nm offsets, parenthetical insertions, 公里/段).
+ */
+export function isIntervalAddress(address: string): boolean {
+  if (!address) return false;
+  return /\d+(?:\.\d+)?\s*(?:[Kk]|公里)[^至]{0,80}?至[^Kk公里]{0,80}?\d+(?:\.\d+)?\s*(?:[Kk]|公里)/.test(
+    address,
+  );
+}
+
+/**
  * Phrase test: does this 取締項目 string contain ONLY 超速 (no 闖紅燈 etc.)?
  * Such rows belong to kind="fixed" and should be skipped when emitting tech.
  */

@@ -2,6 +2,8 @@ import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { DataBundle, EnforcementPoint } from "../lib/types";
+import { safeFetchText, fetchLastModified } from "../lib/fetch";
+import { isIntervalAddress } from "../lib/pdf";
 
 const FIXED_CSV =
   "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/EA5E6FCD-B82D-43B7-A5CF-E9893253187E/resource/20A22CBE-D705-4DBE-8851-4C63B4806DE4/download";
@@ -22,27 +24,18 @@ function parseCSV(text: string): string[][] {
       if (c === '"' && text[i + 1] === '"') {
         field += '"';
         i++;
-      } else if (c === '"') {
-        inQuotes = false;
-      } else {
-        field += c;
-      }
-    } else {
-      if (c === '"') inQuotes = true;
-      else if (c === ",") {
-        row.push(field);
-        field = "";
-      } else if (c === "\n") {
-        row.push(field);
-        rows.push(row);
-        row = [];
-        field = "";
-      } else if (c === "\r") {
-        // skip
-      } else {
-        field += c;
-      }
-    }
+      } else if (c === '"') inQuotes = false;
+      else field += c;
+    } else if (c === '"') inQuotes = true;
+    else if (c === ",") {
+      row.push(field);
+      field = "";
+    } else if (c === "\n") {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else if (c !== "\r") field += c;
   }
   if (field.length > 0 || row.length > 0) {
     row.push(field);
@@ -51,23 +44,15 @@ function parseCSV(text: string): string[][] {
   return rows;
 }
 
-function stripBOM(s: string): string {
-  return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
-}
-
 async function fetchFixedCameras(): Promise<{
-  points: EnforcementPoint[];
+  fixed: EnforcementPoint[];
   fetchedAt: string;
 }> {
-  const res = await fetch(FIXED_CSV, {
-    headers: { "User-Agent": "FlashForce-scraper/0.1 (+https://github.com/)" },
-  });
-  if (!res.ok) throw new Error(`Fixed cameras CSV fetch failed: ${res.status}`);
-  const text = stripBOM(await res.text());
+  const text = await safeFetchText(FIXED_CSV, "全國固定測速 CSV");
   const rows = parseCSV(text);
   // First row: english headers; second row: chinese headers; rest: data
   const dataRows = rows.slice(2).filter((r) => r.length >= 9 && r[5] && r[6]);
-  const points: EnforcementPoint[] = [];
+  const fixed: EnforcementPoint[] = [];
   for (const r of dataRows) {
     const [city, district, address, dept, branch, lng, lat, direction, limit] =
       r;
@@ -75,9 +60,11 @@ async function fetchFixedCameras(): Promise<{
     const latN = Number.parseFloat(lat);
     if (!Number.isFinite(lngN) || !Number.isFinite(latN)) continue;
     if (latN < 21 || latN > 26.5 || lngN < 118 || lngN > 122.5) continue;
+    // skip 區間 patterns — scrape-tech.ts re-emits those as tech kind
+    if (isIntervalAddress(address)) continue;
     const limitN = Number.parseInt(limit, 10);
-    points.push({
-      id: `fixed-${points.length + 1}`,
+    fixed.push({
+      id: `fixed-${fixed.length + 1}`,
       kind: "fixed",
       city: city.trim(),
       district: district.trim(),
@@ -90,24 +77,7 @@ async function fetchFixedCameras(): Promise<{
       branch: branch?.trim() || undefined,
     });
   }
-  return { points, fetchedAt: new Date().toISOString() };
-}
-
-async function tryReadSourceUpdatedAt(): Promise<string | null> {
-  try {
-    const res = await fetch(FIXED_LANDING, {
-      headers: { "User-Agent": "FlashForce-scraper/0.1" },
-    });
-    if (!res.ok) return null;
-    const html = await res.text();
-    // Look for "詮釋資料更新時間" or "metadata last updated"
-    const m = html.match(
-      /(?:詮釋資料更新時間|metadata\s*last\s*updated)[^<]{0,40}?(\d{4}[-/]\d{1,2}[-/]\d{1,2})/i,
-    );
-    return m?.[1] ?? null;
-  } catch {
-    return null;
-  }
+  return { fixed, fetchedAt: new Date().toISOString() };
 }
 
 async function loadExisting(): Promise<DataBundle | null> {
@@ -121,18 +91,13 @@ async function loadExisting(): Promise<DataBundle | null> {
 
 async function main() {
   console.log("[FlashForce scrape] fetching fixed-camera data…");
-  const fixed = await fetchFixedCameras();
-  const sourceUpdatedAt = await tryReadSourceUpdatedAt();
-  console.log(`  fixed cameras: ${fixed.points.length}`);
+  const { fixed, fetchedAt } = await fetchFixedCameras();
+  const lastMod = await fetchLastModified(FIXED_CSV);
+  console.log(`  fixed cameras: ${fixed.length} (intervals → tech in scrape-tech)`);
 
   const existing = await loadExisting();
-  // preserve previously scraped tech / mobile points if present
-  const otherPoints = (existing?.points ?? []).filter(
-    (p) => p.kind !== "fixed",
-  );
-  const otherSources = (existing?.sources ?? []).filter(
-    (s) => s.kind !== "fixed",
-  );
+  const otherPoints = (existing?.points ?? []).filter((p) => p.kind !== "fixed");
+  const otherSources = (existing?.sources ?? []).filter((s) => s.kind !== "fixed");
 
   const bundle: DataBundle = {
     generatedAt: new Date().toISOString(),
@@ -141,14 +106,14 @@ async function main() {
         kind: "fixed",
         label: "全國固定式測速執法設置點 (警政署)",
         sourceUrl: FIXED_LANDING,
-        sourceUpdatedAt,
-        fetchedAt: fixed.fetchedAt,
+        sourceUpdatedAt: lastMod,
+        fetchedAt,
         license: "政府資料開放授權條款 v1",
-        count: fixed.points.length,
+        count: fixed.length,
       },
       ...otherSources,
     ],
-    points: [...fixed.points, ...otherPoints],
+    points: [...fixed, ...otherPoints],
   };
 
   await mkdir(OUT_DIR, { recursive: true });

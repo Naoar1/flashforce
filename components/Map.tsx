@@ -16,7 +16,7 @@ const KIND_LABEL: Record<EnforcementPoint["kind"], string> = {
   mobile: "機動測速",
 };
 
-function formatTime(iso: string | null): string {
+function formatTime(iso: string | null, full = true): string {
   if (!iso) return "未提供";
   try {
     const d = new Date(iso);
@@ -25,8 +25,7 @@ function formatTime(iso: string | null): string {
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
+      ...(full ? { hour: "2-digit", minute: "2-digit", hour12: false } : {}),
       timeZone: "Asia/Taipei",
     }).format(d);
   } catch {
@@ -61,8 +60,13 @@ function popupHtml(p: EnforcementPoint): string {
     rows.push(
       `<div style="font-size:12px;color:#7d8693">${escape(p.authority)}${p.branch ? ` · ${escape(p.branch)}` : ""}</div>`,
     );
+  const mapsURL = `https://www.google.com/maps/search/?api=1&query=${p.lat},${p.lng}`;
+  const streetViewURL = `https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${p.lat},${p.lng}`;
   rows.push(
-    `<div style="margin-top:8px"><a href="https://www.google.com/maps/dir/?api=1&destination=${p.lat},${p.lng}" target="_blank" rel="noopener" style="font-size:12px;color:#1284e8;text-decoration:underline">在 Google Maps 開啟導航</a></div>`,
+    `<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+      <a href="${mapsURL}" target="_blank" rel="noopener" style="font-size:12px;color:#1284e8;text-decoration:underline">在 Google Maps 開啟位置</a>
+      <a href="${streetViewURL}" target="_blank" rel="noopener" style="font-size:12px;color:#1284e8;text-decoration:underline">街景</a>
+    </div>`,
   );
   return rows.join("");
 }
@@ -90,9 +94,10 @@ export default function MapView({ bundle }: { bundle: DataBundle }) {
         zoom: 8,
         minZoom: 7,
         maxZoom: 18,
-        zoomControl: true,
+        zoomControl: false, // we add our own at bottomleft below
         preferCanvas: true,
       });
+      L.control.zoom({ position: "bottomleft" }).addTo(map);
       L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
         attribution:
           '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
@@ -176,10 +181,11 @@ export default function MapView({ bundle }: { bundle: DataBundle }) {
       <div ref={containerRef} className="absolute inset-0" />
       <SearchPanel onPick={(lat, lng) => flyTo(lat, lng, 15)} />
       <FilterPanel filter={filter} setFilter={setFilter} bundle={bundle} />
+      <AskPanel onPick={(lat, lng) => flyTo(lat, lng, 16)} />
       <button
         type="button"
         onClick={locateMe}
-        className="absolute right-3 top-44 z-[1000] flex h-11 w-11 items-center justify-center rounded-full border-2 border-ink-900 bg-white shadow-sketch hover:bg-ink-50"
+        className="absolute bottom-32 left-3 z-[1000] flex h-10 w-10 items-center justify-center rounded-md border-2 border-ink-900 bg-white shadow-sketch hover:bg-ink-50"
         aria-label="定位到我的位置"
         title="定位到我的位置"
       >
@@ -339,6 +345,172 @@ function SearchPanel({
   );
 }
 
+interface AskCitation {
+  id: string;
+  kind: EnforcementPoint["kind"];
+  address: string;
+  lat: number;
+  lng: number;
+}
+
+function AskPanel({
+  onPick,
+}: {
+  onPick: (lat: number, lng: number) => void;
+}) {
+  const [collapsed, setCollapsed] = useState(true);
+  const [q, setQ] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [answer, setAnswer] = useState<string | null>(null);
+  const [cited, setCited] = useState<AskCitation[]>([]);
+  const [err, setErr] = useState<string | null>(null);
+
+  const HINTS = [
+    "仰德大道上陽明山測速點插在哪裡",
+    "中正橋接水快有科技執法點嗎",
+    "台64區間限速多少",
+  ];
+
+  async function ask(text: string) {
+    if (!text.trim()) return;
+    setLoading(true);
+    setErr(null);
+    setAnswer(null);
+    setCited([]);
+    try {
+      const res = await fetch("/api/ask", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ question: text }),
+      });
+      if (!res.ok) {
+        setErr(`HTTP ${res.status}`);
+      } else {
+        const data = (await res.json()) as {
+          answer?: string;
+          cited?: AskCitation[];
+          error?: string;
+        };
+        if (data.error) setErr(data.error);
+        else {
+          setAnswer(data.answer ?? "");
+          setCited(data.cited ?? []);
+        }
+      }
+    } catch (e) {
+      setErr(String((e as Error).message));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (collapsed) {
+    return (
+      <button
+        type="button"
+        onClick={() => setCollapsed(false)}
+        className="absolute right-3 top-56 z-[1000] flex items-center gap-1.5 rounded-full border-2 border-ink-900 bg-white px-3 py-1.5 text-sm font-semibold text-ink-900 shadow-sketch hover:bg-ink-50"
+        title="自然語言問問題"
+      >
+        <span>✨</span>
+        <span>問問題</span>
+      </button>
+    );
+  }
+
+  return (
+    <div className="absolute right-3 top-56 z-[1000] flex max-h-[60vh] w-80 flex-col overflow-hidden rounded-2xl border-2 border-ink-900 bg-white/95 shadow-sketch backdrop-blur">
+      <div className="flex items-center justify-between border-b border-ink-100 px-3 py-2">
+        <div className="flex items-center gap-1.5 font-sketch text-lg leading-none text-ink-900">
+          <span>✨</span> 問 FlashForce
+        </div>
+        <button
+          type="button"
+          onClick={() => setCollapsed(true)}
+          className="text-ink-400 hover:text-ink-900"
+          aria-label="收起"
+        >
+          ✕
+        </button>
+      </div>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          ask(q);
+        }}
+        className="flex items-center gap-2 px-3 py-2"
+      >
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="例如「台64 區間限速多少」"
+          maxLength={200}
+          className="flex-1 rounded-md border border-ink-200 px-2 py-1 text-sm text-ink-900 outline-none focus:border-ai-500"
+        />
+        <button
+          type="submit"
+          disabled={loading || !q.trim()}
+          className="rounded-md border-2 border-ink-900 bg-ai-500 px-2 py-1 text-sm font-semibold text-white shadow-sketch disabled:opacity-50"
+        >
+          {loading ? "…" : "送"}
+        </button>
+      </form>
+      <div className="border-t border-ink-100 px-3 py-2">
+        <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+          Try this hint
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          {HINTS.map((h) => (
+            <button
+              key={h}
+              type="button"
+              onClick={() => {
+                setQ(h);
+                ask(h);
+              }}
+              className="rounded-full border border-ink-200 px-2 py-0.5 text-[11px] text-ink-600 hover:border-ai-500 hover:text-ai-500"
+            >
+              {h}
+            </button>
+          ))}
+        </div>
+      </div>
+      {(loading || answer || err || cited.length > 0) && (
+        <div className="flex-1 overflow-auto border-t border-ink-100 px-3 py-2 text-sm">
+          {loading && (
+            <div className="text-ink-400">查詢中（模型在 Cloudflare 邊端跑，約 2-5 秒）…</div>
+          )}
+          {err && <div className="text-radar-700">錯誤：{err}</div>}
+          {answer && (
+            <div className="whitespace-pre-wrap leading-relaxed text-ink-900">
+              {answer}
+            </div>
+          )}
+          {cited.length > 0 && (
+            <div className="mt-2 border-t border-ink-100 pt-2">
+              <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+                引用點位 ({cited.length})
+              </div>
+              <ul className="space-y-0.5 text-[11px]">
+                {cited.slice(0, 12).map((c) => (
+                  <li
+                    key={c.id}
+                    onClick={() => onPick(c.lat, c.lng)}
+                    className="cursor-pointer rounded px-1 hover:bg-ink-50"
+                  >
+                    <span className="text-ink-400">[{c.id}]</span>{" "}
+                    <span className="text-ink-900">{c.address}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function FilterPanel({
   filter,
   setFilter,
@@ -405,13 +577,28 @@ function Footer({ bundle }: { bundle: DataBundle }) {
     tech: bundle.points.filter((p) => p.kind === "tech").length,
     mobile: bundle.points.filter((p) => p.kind === "mobile").length,
   };
+  // hide 0-count, group by kind, sort within group by count desc
+  const grouped: Record<EnforcementPoint["kind"], DataBundle["sources"]> = {
+    fixed: [],
+    tech: [],
+    mobile: [],
+  };
+  for (const s of bundle.sources) {
+    if (s.count === 0) continue;
+    grouped[s.kind].push(s);
+  }
+  for (const k of Object.keys(grouped) as EnforcementPoint["kind"][]) {
+    grouped[k].sort((a, b) => b.count - a.count);
+  }
+  const totalSources =
+    grouped.fixed.length + grouped.tech.length + grouped.mobile.length;
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[1000] flex justify-center px-3 pb-3">
       <div className="pointer-events-auto max-w-3xl rounded-xl border-2 border-ink-900 bg-white/95 px-3 py-2 text-[11px] leading-snug text-ink-600 shadow-sketch backdrop-blur">
         <div className="flex flex-wrap items-baseline gap-x-3">
           <span>
-            <span className="font-semibold text-ink-900">本站抓取：</span>
-            {formatTime(bundle.generatedAt)}
+            <span className="font-semibold text-ink-900">最近爬蟲完成：</span>
+            {formatTime(bundle.generatedAt)} (台灣時間)
           </span>
           <span className="text-ink-400">
             固定 {totals.fixed} · 科技 {totals.tech} · 機動 {totals.mobile}
@@ -421,26 +608,37 @@ function Footer({ bundle }: { bundle: DataBundle }) {
             onClick={() => setOpen((v) => !v)}
             className="ml-auto text-ai-500 underline-offset-2 hover:underline"
           >
-            {open ? "收起資料來源" : `展開 ${bundle.sources.length} 個來源`}
+            {open ? "收起資料來源" : `展開 ${totalSources} 個來源`}
           </button>
         </div>
         {open && (
-          <ul className="mt-1 max-h-40 space-y-0.5 overflow-auto">
-            {bundle.sources.map((s) => (
-              <li key={s.kind + s.label}>
-                <span className="text-ink-400">[{KIND_LABEL[s.kind]}]</span>{" "}
-                <a
-                  href={s.sourceUrl}
-                  target="_blank"
-                  rel="noopener"
-                  className="text-ai-500 hover:underline"
-                >
-                  {s.label}
-                </a>
-                （{s.count} 筆，來源更新 {formatTime(s.sourceUpdatedAt)}）
-              </li>
-            ))}
-          </ul>
+          <div className="mt-1 max-h-48 overflow-auto">
+            {(["fixed", "tech", "mobile"] as const).map((k) =>
+              grouped[k].length === 0 ? null : (
+                <div key={k} className="mt-1">
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-ink-400">
+                    {KIND_LABEL[k]}（{grouped[k].length} 個源）
+                  </div>
+                  <ul className="space-y-0.5">
+                    {grouped[k].map((s) => (
+                      <li key={s.label}>
+                        <a
+                          href={s.sourceUrl}
+                          target="_blank"
+                          rel="noopener"
+                          className="text-ai-500 hover:underline"
+                        >
+                          {s.label}
+                        </a>
+                        （{s.count} 筆，來源更新{" "}
+                        {formatTime(s.sourceUpdatedAt, false)}）
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ),
+            )}
+          </div>
         )}
         <div className="mt-1 text-ink-400">
           ⚠ 資料僅供參考，實際取締請依現場標示與員警指揮為準。地點搜尋使用 Nominatim/OpenStreetMap。

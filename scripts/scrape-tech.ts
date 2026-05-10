@@ -18,10 +18,12 @@ import {
   buildCoordIndex,
   fetchPDFText,
   findLatestAttachment,
+  isIntervalAddress,
   isPureSpeedingPhrase,
   lookupCoord,
   parseNTPCRows,
 } from "../lib/pdf";
+import { fetchLastModified } from "../lib/fetch";
 import { flushCache, geocodeAddress, getApiCallsMade } from "../lib/geocode";
 import {
   parseTaichungFixed,
@@ -94,6 +96,52 @@ interface SourceResult {
   sourceUpdatedAt: string | null;
   fetchedAt: string;
   points: EnforcementPoint[];
+}
+
+// ============ 0. 全國 7320 → 區間測速 重分類 ============
+//
+// 7320 dataset 把區間測速跟點測速混在一起。我們在這裡專門撈區間 pattern 的列，
+// 標 kind="tech" enforcementType="區間測速"。對應 scrape.ts 已 skip 這些列。
+
+const FIXED_CSV_FOR_INTERVAL =
+  "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/EA5E6FCD-B82D-43B7-A5CF-E9893253187E/resource/20A22CBE-D705-4DBE-8851-4C63B4806DE4/download";
+
+async function fetchNationwideIntervals(): Promise<SourceResult> {
+  const text = await safeFetchText(FIXED_CSV_FOR_INTERVAL, "全國區間");
+  const rows = parseCSV(text);
+  const points: EnforcementPoint[] = [];
+  for (const r of rows.slice(2)) {
+    if (r.length < 9) continue;
+    const [city, district, address, dept, branch, lng, lat, direction, limit] =
+      r;
+    if (!isIntervalAddress(address ?? "")) continue;
+    const la = Number.parseFloat(lat);
+    const ln = Number.parseFloat(lng);
+    if (!Number.isFinite(la) || !Number.isFinite(ln) || !inTaiwan(la, ln))
+      continue;
+    const lim = Number.parseInt(limit, 10);
+    points.push({
+      id: "",
+      kind: "tech",
+      city: city?.trim() ?? "",
+      district: district?.trim() ?? "",
+      address: address?.trim() ?? "",
+      lat: la,
+      lng: ln,
+      speedLimit: Number.isFinite(lim) ? lim : undefined,
+      direction: direction?.trim() || undefined,
+      enforcementType: "區間測速",
+      authority: dept?.trim() || undefined,
+      branch: branch?.trim() || undefined,
+    });
+  }
+  return {
+    label: "全國區間測速 (從 7320 重分類)",
+    sourceUrl: "https://data.gov.tw/dataset/7320",
+    sourceUpdatedAt: await fetchLastModified(FIXED_CSV_FOR_INTERVAL),
+    fetchedAt: new Date().toISOString(),
+    points,
+  };
 }
 
 // ============ 1. 國道闖紅燈 ============
@@ -764,6 +812,7 @@ async function rowsToTechWithGeocode(
 
 // ============ orchestrator ============
 const SOURCES: Array<() => Promise<SourceResult>> = [
+  fetchNationwideIntervals,
   fetchHighwayRedlight,
   fetchTaipeiSmart,
   fetchKaohsiungFixed,
