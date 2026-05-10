@@ -61,7 +61,9 @@ function popupHtml(p: EnforcementPoint): string {
       `<div style="font-size:12px;color:#7d8693">${escape(p.authority)}${p.branch ? ` · ${escape(p.branch)}` : ""}</div>`,
     );
   const mapsURL = `https://www.google.com/maps/search/?api=1&query=${p.lat},${p.lng}`;
-  const streetViewURL = `https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${p.lat},${p.lng}`;
+  // cbll= snaps to nearest available pano (vs viewpoint= which tries exact coords
+  // and shows black if no Street View imagery exists at that point).
+  const streetViewURL = `https://www.google.com/maps?cbll=${p.lat},${p.lng}&layer=c`;
   rows.push(
     `<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
       <a href="${mapsURL}" target="_blank" rel="noopener" style="font-size:12px;color:#1284e8;text-decoration:underline">在 Google Maps 開啟位置</a>
@@ -98,6 +100,31 @@ export default function MapView({ bundle }: { bundle: DataBundle }) {
         preferCanvas: true,
       });
       L.control.zoom({ position: "bottomleft" }).addTo(map);
+
+      // Locate-me as a Leaflet control so it stacks naturally with zoom +/-
+      const LocateControl = L.Control.extend({
+        options: { position: "bottomleft" },
+        onAdd() {
+          const div = L.DomUtil.create(
+            "div",
+            "leaflet-bar leaflet-control",
+          ) as HTMLDivElement;
+          div.innerHTML = `<a href="#" title="定位到我的位置" role="button" aria-label="定位到我的位置" style="display:flex;align-items:center;justify-content:center;width:30px;height:30px;background:#fff">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0f1218" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>
+            </svg>
+          </a>`;
+          L.DomEvent.disableClickPropagation(div);
+          L.DomEvent.on(div, "click", (e) => {
+            L.DomEvent.preventDefault(e);
+            locateMe();
+          });
+          return div;
+        },
+      });
+      new LocateControl().addTo(map);
+
       L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
         attribution:
           '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
@@ -182,28 +209,6 @@ export default function MapView({ bundle }: { bundle: DataBundle }) {
       <SearchPanel onPick={(lat, lng) => flyTo(lat, lng, 15)} />
       <FilterPanel filter={filter} setFilter={setFilter} bundle={bundle} />
       <AskPanel onPick={(lat, lng) => flyTo(lat, lng, 16)} />
-      <button
-        type="button"
-        onClick={locateMe}
-        className="absolute bottom-32 left-3 z-[1000] flex h-10 w-10 items-center justify-center rounded-md border-2 border-ink-900 bg-white shadow-sketch hover:bg-ink-50"
-        aria-label="定位到我的位置"
-        title="定位到我的位置"
-      >
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="22"
-          height="22"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="#0f1218"
-          strokeWidth="2.2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <circle cx="12" cy="12" r="3" />
-          <path d="M12 2v3M12 19v3M2 12h3M19 12h3" />
-        </svg>
-      </button>
       <Footer bundle={bundle} />
     </div>
   );
@@ -353,23 +358,22 @@ interface AskCitation {
   lng: number;
 }
 
-function AskPanel({
+const ASK_HINTS = [
+  "仰德大道上陽明山測速點插在哪裡",
+  "中正橋接水快有科技執法點嗎",
+  "台64區間限速多少",
+];
+
+function AskBody({
   onPick,
 }: {
   onPick: (lat: number, lng: number) => void;
 }) {
-  const [collapsed, setCollapsed] = useState(true);
   const [q, setQ] = useState("");
   const [loading, setLoading] = useState(false);
   const [answer, setAnswer] = useState<string | null>(null);
   const [cited, setCited] = useState<AskCitation[]>([]);
   const [err, setErr] = useState<string | null>(null);
-
-  const HINTS = [
-    "仰德大道上陽明山測速點插在哪裡",
-    "中正橋接水快有科技執法點嗎",
-    "台64區間限速多少",
-  ];
 
   async function ask(text: string) {
     if (!text.trim()) return;
@@ -384,7 +388,7 @@ function AskPanel({
         body: JSON.stringify({ question: text }),
       });
       if (!res.ok) {
-        setErr(`HTTP ${res.status}`);
+        setErr(`HTTP ${res.status}（本地 dev server 沒接 Worker，需部署到 CF 才能跑）`);
       } else {
         const data = (await res.json()) as {
           answer?: string;
@@ -404,81 +408,49 @@ function AskPanel({
     }
   }
 
-  if (collapsed) {
-    return (
-      <button
-        type="button"
-        onClick={() => setCollapsed(false)}
-        className="absolute right-3 top-56 z-[1000] flex items-center gap-1.5 rounded-full border-2 border-ink-900 bg-white px-3 py-1.5 text-sm font-semibold text-ink-900 shadow-sketch hover:bg-ink-50"
-        title="自然語言問問題"
-      >
-        <span>✨</span>
-        <span>問問題</span>
-      </button>
-    );
-  }
-
   return (
-    <div className="absolute right-3 top-56 z-[1000] flex max-h-[60vh] w-80 flex-col overflow-hidden rounded-2xl border-2 border-ink-900 bg-white/95 shadow-sketch backdrop-blur">
-      <div className="flex items-center justify-between border-b border-ink-100 px-3 py-2">
-        <div className="flex items-center gap-1.5 font-sketch text-lg leading-none text-ink-900">
-          <span>✨</span> 問 FlashForce
-        </div>
-        <button
-          type="button"
-          onClick={() => setCollapsed(true)}
-          className="text-ink-400 hover:text-ink-900"
-          aria-label="收起"
-        >
-          ✕
-        </button>
-      </div>
+    <div className="flex flex-col gap-2">
       <form
         onSubmit={(e) => {
           e.preventDefault();
           ask(q);
         }}
-        className="flex items-center gap-2 px-3 py-2"
+        className="flex items-center gap-1.5"
       >
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
           placeholder="例如「台64 區間限速多少」"
           maxLength={200}
-          className="flex-1 rounded-md border border-ink-200 px-2 py-1 text-sm text-ink-900 outline-none focus:border-ai-500"
+          className="flex-1 rounded-md border border-ink-200 px-2 py-1 text-xs text-ink-900 outline-none focus:border-ai-500"
         />
         <button
           type="submit"
           disabled={loading || !q.trim()}
-          className="rounded-md border-2 border-ink-900 bg-ai-500 px-2 py-1 text-sm font-semibold text-white shadow-sketch disabled:opacity-50"
+          className="rounded-md border-2 border-ink-900 bg-ai-500 px-2 py-1 text-xs font-semibold text-white shadow-sketch disabled:opacity-50"
         >
           {loading ? "…" : "送"}
         </button>
       </form>
-      <div className="border-t border-ink-100 px-3 py-2">
-        <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-ink-400">
-          Try this hint
-        </div>
-        <div className="flex flex-wrap gap-1.5">
-          {HINTS.map((h) => (
-            <button
-              key={h}
-              type="button"
-              onClick={() => {
-                setQ(h);
-                ask(h);
-              }}
-              className="rounded-full border border-ink-200 px-2 py-0.5 text-[11px] text-ink-600 hover:border-ai-500 hover:text-ai-500"
-            >
-              {h}
-            </button>
-          ))}
-        </div>
+      <div className="flex flex-wrap gap-1">
+        {ASK_HINTS.map((h) => (
+          <button
+            key={h}
+            type="button"
+            onClick={() => {
+              setQ(h);
+              ask(h);
+            }}
+            className="rounded-full border border-ink-200 px-2 py-0.5 text-[10px] text-ink-600 hover:border-ai-500 hover:text-ai-500"
+          >
+            {h}
+          </button>
+        ))}
       </div>
       {(loading || answer || err || cited.length > 0) && (
-        <div className="flex-1 overflow-auto border-t border-ink-100 px-3 py-2 text-sm">
+        <div className="max-h-60 overflow-auto rounded-md bg-ink-50 px-2 py-1.5 text-xs">
           {loading && (
-            <div className="text-ink-400">查詢中（模型在 Cloudflare 邊端跑，約 2-5 秒）…</div>
+            <div className="text-ink-400">查詢中（CF 邊端 llama，2–5 秒）…</div>
           )}
           {err && <div className="text-radar-700">錯誤：{err}</div>}
           {answer && (
@@ -487,16 +459,16 @@ function AskPanel({
             </div>
           )}
           {cited.length > 0 && (
-            <div className="mt-2 border-t border-ink-100 pt-2">
-              <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-ink-400">
-                引用點位 ({cited.length})
+            <div className="mt-1 border-t border-ink-200 pt-1">
+              <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-ink-400">
+                引用 {cited.length} 點
               </div>
-              <ul className="space-y-0.5 text-[11px]">
+              <ul className="space-y-0.5">
                 {cited.slice(0, 12).map((c) => (
                   <li
                     key={c.id}
                     onClick={() => onPick(c.lat, c.lng)}
-                    className="cursor-pointer rounded px-1 hover:bg-ink-50"
+                    className="cursor-pointer rounded px-1 text-[10px] hover:bg-white"
                   >
                     <span className="text-ink-400">[{c.id}]</span>{" "}
                     <span className="text-ink-900">{c.address}</span>
@@ -554,11 +526,11 @@ function FilterPanel({
     </label>
   );
   return (
-    <div className="absolute right-3 top-3 z-[1000] w-56 rounded-2xl border-2 border-ink-900 bg-white/95 p-3 shadow-sketch backdrop-blur">
-      <div className="mb-2 font-sketch text-2xl leading-none text-ink-900">
+    <div className="absolute right-3 top-3 z-[1000] w-64 rounded-2xl border-2 border-ink-900 bg-white/95 p-3 shadow-sketch backdrop-blur">
+      <div className="font-sketch text-2xl leading-none text-ink-900">
         FlashForce
       </div>
-      <div className="mb-2 text-xs text-ink-400">
+      <div className="mt-0.5 mb-2 text-xs text-ink-400">
         全台科技執法・測速地圖
       </div>
       <div className="space-y-0.5">
@@ -570,6 +542,49 @@ function FilterPanel({
   );
 }
 
+function AskPanel({
+  onPick,
+}: {
+  onPick: (lat: number, lng: number) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="absolute right-3 top-[198px] z-[1000] w-64 overflow-hidden rounded-2xl border-2 border-ink-900 bg-white/95 shadow-sketch backdrop-blur">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between px-3 py-2 text-sm text-ink-900 hover:bg-ink-50"
+      >
+        <span className="flex items-center gap-1.5 font-semibold">
+          <span>✨</span>
+          <span>自然語言問答</span>
+        </span>
+        <span className="text-xs text-ink-400">{open ? "▲" : "▼"}</span>
+      </button>
+      {open && (
+        <div className="max-h-[60vh] overflow-auto border-t-2 border-ink-100 px-3 py-2">
+          <AskBody onPick={onPick} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** strip "(...)" parentheticals + filename-like suffixes from long labels */
+function shortenLabel(label: string): string {
+  return label
+    .replace(/\s*\([^)]*\)\s*/g, " ")
+    .replace(/\.pdf$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const KIND_BG: Record<EnforcementPoint["kind"], string> = {
+  fixed: "bg-radar-50 text-radar-700",
+  tech: "bg-ai-50 text-ai-600",
+  mobile: "bg-mobile-50 text-mobile-700",
+};
+
 function Footer({ bundle }: { bundle: DataBundle }) {
   const [open, setOpen] = useState(false);
   const totals = {
@@ -577,7 +592,6 @@ function Footer({ bundle }: { bundle: DataBundle }) {
     tech: bundle.points.filter((p) => p.kind === "tech").length,
     mobile: bundle.points.filter((p) => p.kind === "mobile").length,
   };
-  // hide 0-count, group by kind, sort within group by count desc
   const grouped: Record<EnforcementPoint["kind"], DataBundle["sources"]> = {
     fixed: [],
     tech: [],
@@ -594,11 +608,12 @@ function Footer({ bundle }: { bundle: DataBundle }) {
     grouped.fixed.length + grouped.tech.length + grouped.mobile.length;
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[1000] flex justify-center px-3 pb-3">
-      <div className="pointer-events-auto max-w-3xl rounded-xl border-2 border-ink-900 bg-white/95 px-3 py-2 text-[11px] leading-snug text-ink-600 shadow-sketch backdrop-blur">
-        <div className="flex flex-wrap items-baseline gap-x-3">
+      <div className="pointer-events-auto w-full max-w-4xl rounded-xl border-2 border-ink-900 bg-white/95 px-3 py-2 text-[11px] leading-snug text-ink-600 shadow-sketch backdrop-blur">
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
           <span>
             <span className="font-semibold text-ink-900">最近爬蟲完成：</span>
-            {formatTime(bundle.generatedAt)} (台灣時間)
+            {formatTime(bundle.generatedAt)}
+            <span className="ml-1 text-ink-400">(GMT+8)</span>
           </span>
           <span className="text-ink-400">
             固定 {totals.fixed} · 科技 {totals.tech} · 機動 {totals.mobile}
@@ -608,30 +623,48 @@ function Footer({ bundle }: { bundle: DataBundle }) {
             onClick={() => setOpen((v) => !v)}
             className="ml-auto text-ai-500 underline-offset-2 hover:underline"
           >
-            {open ? "收起資料來源" : `展開 ${totalSources} 個來源`}
+            {open ? "收起" : `展開 ${totalSources} 個來源`}
           </button>
         </div>
         {open && (
-          <div className="mt-1 max-h-48 overflow-auto">
+          <div className="mt-2 max-h-56 overflow-auto">
             {(["fixed", "tech", "mobile"] as const).map((k) =>
               grouped[k].length === 0 ? null : (
-                <div key={k} className="mt-1">
-                  <div className="text-[10px] font-semibold uppercase tracking-wide text-ink-400">
-                    {KIND_LABEL[k]}（{grouped[k].length} 個源）
+                <div key={k} className="mb-2">
+                  <div className="mb-1 flex items-baseline gap-1.5">
+                    <span
+                      className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${KIND_BG[k]}`}
+                    >
+                      {KIND_LABEL[k]}
+                    </span>
+                    <span className="text-[10px] text-ink-400">
+                      {grouped[k].length} 個源 · {totals[k]} 點
+                    </span>
                   </div>
                   <ul className="space-y-0.5">
                     {grouped[k].map((s) => (
-                      <li key={s.label}>
+                      <li
+                        key={s.label}
+                        className="flex items-baseline gap-3"
+                      >
                         <a
                           href={s.sourceUrl}
                           target="_blank"
                           rel="noopener"
-                          className="text-ai-500 hover:underline"
+                          className="min-w-0 truncate text-ink-900 hover:text-ai-500 hover:underline"
+                          title={s.label}
                         >
-                          {s.label}
+                          {shortenLabel(s.label)}
                         </a>
-                        （{s.count} 筆，來源更新{" "}
-                        {formatTime(s.sourceUpdatedAt, false)}）
+                        <span className="shrink-0 font-mono text-ink-600">
+                          {s.count} 點
+                        </span>
+                        <span className="shrink-0 font-mono text-ink-400">
+                          來源更新{" "}
+                          {s.sourceUpdatedAt
+                            ? formatTime(s.sourceUpdatedAt, false)
+                            : "—"}
+                        </span>
                       </li>
                     ))}
                   </ul>
@@ -641,7 +674,7 @@ function Footer({ bundle }: { bundle: DataBundle }) {
           </div>
         )}
         <div className="mt-1 text-ink-400">
-          ⚠ 資料僅供參考，實際取締請依現場標示與員警指揮為準。地點搜尋使用 Nominatim/OpenStreetMap。
+          ⚠ 資料僅供參考，實際取締請依現場標示與員警指揮為準。
         </div>
       </div>
     </div>
