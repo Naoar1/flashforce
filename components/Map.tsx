@@ -207,8 +207,16 @@ export default function MapView({ bundle }: { bundle: DataBundle }) {
     <div className="relative h-full w-full">
       <div ref={containerRef} className="absolute inset-0" />
       <SearchPanel onPick={(lat, lng) => flyTo(lat, lng, 15)} />
+      {/* Desktop side panels (≥ sm) */}
       <FilterPanel filter={filter} setFilter={setFilter} bundle={bundle} />
       <AskPanel onPick={(lat, lng) => flyTo(lat, lng, 16)} />
+      {/* Mobile (< sm): always-visible Ask bar at top, filter behind small ⚙ */}
+      <MobileAskBar onPick={(lat, lng) => flyTo(lat, lng, 16)} />
+      <MobileFilterDrawer
+        filter={filter}
+        setFilter={setFilter}
+        bundle={bundle}
+      />
       <Footer bundle={bundle} />
     </div>
   );
@@ -298,7 +306,7 @@ function SearchPanel({
   }
 
   return (
-    <div className="absolute left-3 top-3 z-[1000] w-72">
+    <div className="absolute left-3 right-3 top-3 z-[1000] hidden sm:block sm:right-auto sm:w-72">
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -591,6 +599,13 @@ function AskBody({
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
+          onFocus={(e) => {
+            // iOS keyboard slides up over the input; scroll it into view so
+            // the user can see what they're typing.
+            setTimeout(() => {
+              e.target.scrollIntoView({ block: "center", behavior: "smooth" });
+            }, 250);
+          }}
           placeholder="例如「台64 區間限速多少」"
           maxLength={200}
           className="flex-1 rounded-md border border-ink-200 px-2 py-1 text-xs text-ink-900 outline-none focus:border-ai-500"
@@ -689,7 +704,7 @@ function FilterPanel({
     </label>
   );
   return (
-    <div className="absolute right-3 top-3 z-[1000] w-64 rounded-2xl border-2 border-ink-900 bg-white/95 p-3 shadow-sketch backdrop-blur">
+    <div className="absolute right-3 top-3 z-[1000] hidden w-64 rounded-2xl border-2 border-ink-900 bg-white/95 p-3 shadow-sketch backdrop-blur sm:block">
       <div className="font-sketch text-2xl leading-none text-ink-900">
         FlashForce
       </div>
@@ -712,7 +727,7 @@ function AskPanel({
 }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="absolute right-3 top-[198px] z-[1000] w-64 overflow-hidden rounded-2xl border-2 border-ink-900 bg-white/95 shadow-sketch backdrop-blur">
+    <div className="absolute right-3 top-[198px] z-[1000] hidden w-64 overflow-hidden rounded-2xl border-2 border-ink-900 bg-white/95 shadow-sketch backdrop-blur sm:block">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -730,6 +745,135 @@ function AskPanel({
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Mobile-only combined drawer: a ⚙ button at top-right opens a bottom sheet
+ * containing FlashForce title + filter checkboxes + AskBody. Hidden ≥ sm.
+ */
+/**
+ * Mobile (< sm) ALWAYS-VISIBLE Ask bar pinned at the top of the map.
+ * NL Q&A is the project's headline feature, so the input lives at primary
+ * level — no tap-to-open, no drawer. Hint chips, answer area, Turnstile
+ * widget all expand inline below the input as needed.
+ */
+function MobileAskBar({ onPick }: { onPick: (lat: number, lng: number) => void }) {
+  return (
+    <div className="absolute inset-x-3 top-3 z-[1000] rounded-2xl border-2 border-ink-900 bg-white/95 px-3 py-2 shadow-sketch backdrop-blur sm:hidden">
+      <div className="mb-1 flex items-baseline gap-1.5 px-0.5 text-xs font-semibold text-ai-500">
+        <span>✨</span>
+        <span>用自然語言問 FlashForce</span>
+      </div>
+      <AskBody onPick={onPick} />
+    </div>
+  );
+}
+
+/**
+ * Mobile (< sm) filter drawer — small ⚙ icon at bottom-right of viewport
+ * (above the footer), opens a bottom-sheet with the 3 kind checkboxes.
+ * Filter is secondary on mobile; primary surface goes to NL Ask.
+ */
+function MobileFilterDrawer({
+  filter,
+  setFilter,
+  bundle,
+}: {
+  filter: { fixed: boolean; tech: boolean; mobile: boolean };
+  setFilter: React.Dispatch<
+    React.SetStateAction<{ fixed: boolean; tech: boolean; mobile: boolean }>
+  >;
+  bundle: DataBundle;
+}) {
+  const [open, setOpen] = useState(false);
+  const counts = {
+    fixed: bundle.points.filter((p) => p.kind === "fixed").length,
+    tech: bundle.points.filter((p) => p.kind === "tech").length,
+    mobile: bundle.points.filter((p) => p.kind === "mobile").length,
+  };
+  const onCount = (["fixed", "tech", "mobile"] as const).filter((k) => filter[k])
+    .length;
+  const Item = ({
+    k,
+    color,
+    label,
+  }: {
+    k: "fixed" | "tech" | "mobile";
+    color: string;
+    label: string;
+  }) => (
+    <label className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-ink-50">
+      <input
+        type="checkbox"
+        checked={filter[k]}
+        onChange={(e) =>
+          setFilter((f) => ({ ...f, [k]: e.target.checked }))
+        }
+        className="h-4 w-4 accent-radar-500"
+      />
+      <span
+        className="inline-block h-3 w-3 rounded-full border-2 border-ink-900"
+        style={{ background: color }}
+      />
+      <span className="flex-1 text-sm text-ink-900">{label}</span>
+      <span className="text-xs text-ink-400">{counts[k]}</span>
+    </label>
+  );
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        className="absolute bottom-[88px] right-3 z-[1000] flex h-10 items-center gap-1 rounded-full border-2 border-ink-900 bg-white px-3 text-xs font-semibold text-ink-900 shadow-sketch hover:bg-ink-50 sm:hidden"
+        aria-label="篩選類別"
+        title="篩選"
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="#0f1218"
+          strokeWidth="2.4"
+          strokeLinecap="round"
+        >
+          <line x1="4" y1="6" x2="20" y2="6" />
+          <line x1="6" y1="12" x2="18" y2="12" />
+          <line x1="9" y1="18" x2="15" y2="18" />
+        </svg>
+        <span>篩選 {onCount}/3</span>
+      </button>
+      {open && (
+        <div className="fixed inset-0 z-[2000] sm:hidden">
+          <div
+            className="absolute inset-0 bg-ink-900/30"
+            onClick={() => setOpen(false)}
+          />
+          <div className="absolute inset-x-0 bottom-0 flex max-h-[60dvh] flex-col overflow-hidden rounded-t-2xl border-t-2 border-ink-900 bg-white shadow-sketch">
+            <div className="flex items-center justify-between border-b border-ink-100 px-3 py-2">
+              <span className="font-sketch text-lg leading-none text-ink-900">
+                篩選類別
+              </span>
+              <button
+                type="button"
+                onClick={() => setOpen(false)}
+                className="rounded-md px-2 py-1 text-ink-400 hover:bg-ink-50"
+                aria-label="關閉"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="overflow-auto px-2 py-2">
+              <Item k="fixed" color="#ff7a59" label="固定測速" />
+              <Item k="tech" color="#3aa9ff" label="科技執法" />
+              <Item k="mobile" color="#ffc043" label="機動測速" />
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 

@@ -57,6 +57,14 @@ main {
   box-shadow: 2px 2px 0 rgba(15, 18, 24, 0.18);
 }
 
+/* On narrow viewports, push the Leaflet zoom + locate (bottomleft) above
+   the footer panel so they don't overlap. ≥ sm keep default position. */
+@media (max-width: 639px) {
+  .leaflet-bottom.leaflet-left {
+    bottom: 88px !important;
+  }
+}
+
 /* Popup */
 .leaflet-popup-content-wrapper {
   border-radius: 14px;
