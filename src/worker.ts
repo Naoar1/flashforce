@@ -26,6 +26,8 @@ interface Env {
       },
     ) => Promise<{ response?: string }>;
   };
+  TURNSTILE_SITEKEY?: string;
+  TURNSTILE_SECRET?: string;
 }
 
 interface EnforcementPoint {
@@ -258,23 +260,39 @@ async function pickRelevantPoints(
     .map((p) => ({ p, s: scoreRelevance(p, kws) }))
     .sort((a, b) => b.s - a.s);
 
-  // If keyword search yielded NO hits, geocode and use radius
+  // If keyword search hit nothing, try geocoding ALL extracted landmarks and
+  // union by closest-distance to any of them.
   if (scored.length === 0 || scored[0].s === 0) {
     const landmarks = extractLandmarks(question);
+    const coords: Array<{ lat: number; lng: number }> = [];
     for (const lm of landmarks) {
-      const coord = await geocodeLandmark(lm);
-      if (coord) {
-        scored = pool
-          .map((p) => ({ p, s: 1 / (1 + distMeters(coord, p) / 200) }))
-          .sort((a, b) => b.s - a.s);
-        return { points: scored.slice(0, topN).map((x) => x.p), mode: `geo:${lm}` };
+      const c = await geocodeLandmark(lm);
+      if (c) coords.push(c);
+    }
+    if (coords.length > 0) {
+      scored = pool
+        .map((p) => {
+          let minDist = Infinity;
+          for (const c of coords) minDist = Math.min(minDist, distMeters(c, p));
+          return { p, s: 1 / (1 + minDist / 200) };
+        })
+        .sort((a, b) => b.s - a.s);
+      // only keep points within reasonable distance (3 km)
+      scored = scored.filter((x) => x.s > 1 / (1 + 3000 / 200));
+      if (scored.length > 0) {
+        return {
+          points: scored.slice(0, topN).map((x) => x.p),
+          mode: `geo:${landmarks.join(",")}`,
+        };
       }
     }
+    // truly nothing — return empty so the LLM declines politely instead
+    // of dumping random points (which used to surface 金門 due to alphabetical
+    // index order).
+    return { points: [], mode: "empty" };
   }
 
-  // ALWAYS return top-N (no zero-match short-circuit). LLM judges relevance.
-  const result = scored.slice(0, topN).map((x) => x.p);
-  return { points: result, mode: scored[0]?.s ? "keyword" : "fallback" };
+  return { points: scored.slice(0, topN).map((x) => x.p), mode: "keyword" };
 }
 
 // ===== prompt construction =====
@@ -301,18 +319,23 @@ const SYSTEM_PROMPT = `你是 FlashForce 的查詢助手。FlashForce 是台灣�
 1. 用繁體中文，**對話口吻 + 條列**。直接回答問題，不要重複問題。
 2. **列出全部相關點位**（不要只挑一個）。每點開頭加 [id]，方便對照地圖。
 3. 子分類辨識：固定測速、區間測速、闖紅燈、違停、不停讓 等是不同類別 — 答題時要說清楚每點屬於哪一類，不要籠統說「科技執法」。
-4. 如果使用者用簡稱（水快=水源快速道路、環快=環河快速道路、北快=市民大道、國一=國道1號 等）已經為你展開，照展開後回答即可。
-5. 如果清單看起來不完全符合題意，也要**盡力歸納**：可以說「這條路上沒有 XX 類，不過附近有 YY」，附帶列出。**不要直接說「找不到」**，除非清單真的完全空。
-6. 已知速限的點，列出速限數字；有方向的列出方向；區間測速列出起訖里程。
-7. 不要編造清單以外的點。
+4. **絕對不要編造清單裡沒有的欄位**：如果某點清單沒寫速限就不要寫速限；沒寫方向就不要寫方向。誠實回應「速限資訊未提供」。
+5. **絕對不要列出清單以外的點**。每個 [id] 都必須是清單裡實際出現過的。
+6. 如果清單看起來不完全符合題意，誠實說「我看到的清單裡沒有 XX 路 / XX 區的點」，可以附帶提示「附近有以下相關的：...」**前提是清單裡確實有相關項**。
+
+特殊狀況：
+- 清單為空（總共 0 點）→ 回應「資料庫裡沒找到符合的點。可以給更具體的路名 / 行政區 / 路線編號嗎？」**不要編造任何點。**
+- 問題明顯跟交通執法、測速、地點查詢無關（食譜、新聞、政治、閒聊）→ 禮貌拒絕：「我只能回答台灣科技執法 / 測速 / 機動測速地圖相關的問題。」**不要附帶任何清單。**
+
+格式：使用 markdown 條列（每行 \`- [id] ...\`），網頁會把 [id] 變成可點的連結。
 
 範例輸出 1：
 Q: 仰德大道有幾個測速點
 A: 仰德大道有 4 個固定測速：
-- [fixed-905] 2 段 29 巷（速限 50）
-- [fixed-906] 2 段 115 巷口（速限 50）
-- [fixed-907] 4 段 75 號格致國中前（速限 50）
-- [fixed-908] 3 段陽明山國小前（速限 50）
+- [fixed-905] 仰德大道 2 段 29 巷
+- [fixed-906] 仰德大道 2 段 115 巷口
+- [fixed-907] 仰德大道四段 75 號格致國中前
+- [fixed-908] 仰德大道 3 段陽明山國小前
 
 範例輸出 2：
 Q: 台64 區間限速多少
@@ -322,18 +345,73 @@ A: 台64 線上有 3 段區間測速：
 - [tech-29] 西向 1.6K 至 5.4K，速限 80
 
 範例輸出 3：
-Q: 中正橋接水快有科技執法點嗎
-A: 中正橋本身的清單裡沒有科技執法點，但你說的水源快速道路（水快）上有以下：
-- [tech-XX] ...（如清單裡有就列，沒有就說「附近沒有」）`;
+Q: 給我刺客義大利麵食譜
+A: 我只能回答台灣科技執法 / 測速 / 機動測速地圖相關的問題。`;
+
+// ===== rate limit (per-IP, 2-hour rolling window) =====
+//
+// Module-scope counter — simple but imperfect since CF spawns many isolates;
+// a determined attacker hitting different isolates could exceed the cap.
+// For a personal-use site this is OK; upgrade to KV / Durable Objects if abuse
+// is observed.
+interface IPState {
+  count: number;
+  resetAt: number;
+}
+const ipState = new Map<string, IPState>();
+const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+const MAX_PER_WINDOW = 30;
+const TURNSTILE_EVERY = 4; // Q4, Q8, Q12, ... require Turnstile
+
+function getIPState(ip: string): IPState {
+  const now = Date.now();
+  let s = ipState.get(ip);
+  if (!s || now > s.resetAt) {
+    s = { count: 0, resetAt: now + TWO_HOURS_MS };
+    ipState.set(ip, s);
+  }
+  // basic memory hygiene: cap map size
+  if (ipState.size > 5000) {
+    for (const [k, v] of ipState) {
+      if (now > v.resetAt) ipState.delete(k);
+    }
+  }
+  return s;
+}
+
+async function verifyTurnstile(token: string, env: Env): Promise<boolean> {
+  if (!env.TURNSTILE_SECRET) return true; // gracefully open if not configured
+  try {
+    const res = await fetch(
+      "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          secret: env.TURNSTILE_SECRET,
+          response: token,
+        }).toString(),
+      },
+    );
+    if (!res.ok) return false;
+    const data = (await res.json()) as { success: boolean };
+    return data.success === true;
+  } catch {
+    return false;
+  }
+}
 
 // ===== handlers =====
 async function handleAsk(req: Request, env: Env): Promise<Response> {
   if (req.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
   }
-  let body: { question?: string };
+  let body: { question?: string; turnstileToken?: string };
   try {
-    body = (await req.json()) as { question?: string };
+    body = (await req.json()) as {
+      question?: string;
+      turnstileToken?: string;
+    };
   } catch {
     return new Response(JSON.stringify({ error: "invalid JSON" }), {
       status: 400,
@@ -348,15 +426,69 @@ async function handleAsk(req: Request, env: Env): Promise<Response> {
     );
   }
 
+  // Rate limit
+  const ip = req.headers.get("CF-Connecting-IP") ?? "0.0.0.0";
+  const state = getIPState(ip);
+  const turnstileEnabled = !!env.TURNSTILE_SECRET && !!env.TURNSTILE_SITEKEY;
+
+  if (state.count >= MAX_PER_WINDOW) {
+    const retryAfterSec = Math.ceil((state.resetAt - Date.now()) / 1000);
+    return new Response(
+      JSON.stringify({
+        error: "rate-limited",
+        message: `2 小時內已問過 ${MAX_PER_WINDOW} 次，請等 ${Math.ceil(retryAfterSec / 60)} 分鐘後再試。`,
+        retryAfterSec,
+      }),
+      {
+        status: 429,
+        headers: {
+          "content-type": "application/json",
+          "Retry-After": String(retryAfterSec),
+        },
+      },
+    );
+  }
+
+  // Every TURNSTILE_EVERY-th question: require Turnstile token
+  const isChallengeRequest =
+    turnstileEnabled && (state.count + 1) % TURNSTILE_EVERY === 0;
+  if (isChallengeRequest) {
+    if (!body.turnstileToken) {
+      return new Response(
+        JSON.stringify({
+          requireTurnstile: true,
+          sitekey: env.TURNSTILE_SITEKEY,
+          message: "請完成驗證後重新送出。",
+        }),
+        {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    }
+    const ok = await verifyTurnstile(body.turnstileToken, env);
+    if (!ok) {
+      return new Response(
+        JSON.stringify({
+          error: "Turnstile verification failed",
+          requireTurnstile: true,
+          sitekey: env.TURNSTILE_SITEKEY,
+        }),
+        {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    }
+  }
+
   const bundle = await getBundle(env, req);
   const { points: relevant, mode } = await pickRelevantPoints(bundle, question);
 
-  const userPrompt = `問題：${question}
-
-相關點位（共 ${relevant.length} 點，retrieval mode = ${mode}）：
-${relevant.map(formatPoint).join("\n")}
-
-請依規則回答。`;
+  const userPrompt =
+    relevant.length === 0
+      ? `問題：${question}\n\n相關點位：（清單為空，沒有匹配的點）\n\n請依規則回答。`
+      : `問題：${question}\n\n相關點位（共 ${relevant.length} 點，retrieval mode = ${mode}）：\n${relevant.map(formatPoint).join("\n")}\n\n請依規則回答。`;
 
   const aiResp = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
     messages: [
@@ -369,6 +501,9 @@ ${relevant.map(formatPoint).join("\n")}
 
   const answer = aiResp.response ?? "（模型沒有回應）";
 
+  // Increment counter only on success
+  state.count += 1;
+
   return new Response(
     JSON.stringify({
       answer,
@@ -380,6 +515,7 @@ ${relevant.map(formatPoint).join("\n")}
         lng: p.lng,
       })),
       mode,
+      remainingInWindow: MAX_PER_WINDOW - state.count,
     }),
     { headers: { "content-type": "application/json" } },
   );

@@ -364,6 +364,122 @@ const ASK_HINTS = [
   "台64區間限速多少",
 ];
 
+// Lazy-load Cloudflare Turnstile script (idempotent)
+function loadTurnstileScript() {
+  if (typeof document === "undefined") return;
+  if (document.getElementById("ff-turnstile-script")) return;
+  const s = document.createElement("script");
+  s.id = "ff-turnstile-script";
+  s.src = "https://challenges.cloudflare.com/turnstile/v0/api.js";
+  s.async = true;
+  s.defer = true;
+  document.head.appendChild(s);
+}
+
+declare global {
+  interface Window {
+    turnstile?: {
+      render: (
+        el: HTMLElement,
+        opts: {
+          sitekey: string;
+          callback: (token: string) => void;
+          "error-callback"?: () => void;
+          theme?: "light" | "dark" | "auto";
+          size?: "normal" | "compact";
+        },
+      ) => string;
+      remove: (id: string) => void;
+      reset: (id?: string) => void;
+    };
+  }
+}
+
+/**
+ * Render LLM answer with markdown-ish parsing:
+ *  - lines starting with `- ` or `* ` → bulleted list items
+ *  - `[kind-NNN]` patterns → clickable buttons that fly the map to that point
+ */
+function AnswerView({
+  text,
+  cited,
+  onPick,
+}: {
+  text: string;
+  cited: AskCitation[];
+  onPick: (lat: number, lng: number) => void;
+}) {
+  const idMap = new Map(cited.map((c) => [c.id, c]));
+  const lines = text.split("\n");
+  const out: React.ReactNode[] = [];
+  let bullets: React.ReactNode[] = [];
+  const flushBullets = () => {
+    if (bullets.length) {
+      out.push(
+        <ul
+          key={`ul-${out.length}`}
+          className="ml-3 list-disc space-y-0.5 marker:text-ink-400"
+        >
+          {bullets}
+        </ul>,
+      );
+      bullets = [];
+    }
+  };
+
+  function renderInline(line: string, key: string): React.ReactNode {
+    const re = /\[([a-z]+-\d+)\]/g;
+    const parts: React.ReactNode[] = [];
+    let last = 0;
+    let m: RegExpExecArray | null;
+    let i = 0;
+    while ((m = re.exec(line)) !== null) {
+      if (m.index > last) parts.push(line.slice(last, m.index));
+      const id = m[1];
+      const c = idMap.get(id);
+      if (c) {
+        parts.push(
+          <button
+            type="button"
+            key={`${key}-id-${i++}`}
+            onClick={() => onPick(c.lat, c.lng)}
+            className="inline-flex rounded border border-ai-500 bg-ai-50 px-1 py-0 font-mono text-ai-600 hover:bg-ai-500 hover:text-white"
+            title={c.address}
+          >
+            {id}
+          </button>,
+        );
+      } else {
+        parts.push(`[${id}]`);
+      }
+      last = m.index + m[0].length;
+    }
+    if (last < line.length) parts.push(line.slice(last));
+    return parts;
+  }
+
+  lines.forEach((raw, i) => {
+    const line = raw.replace(/\s+$/, "");
+    const bullet = line.match(/^\s*[-*•]\s+(.*)$/);
+    if (bullet) {
+      bullets.push(
+        <li key={`li-${i}`}>{renderInline(bullet[1], `li-${i}`)}</li>,
+      );
+      return;
+    }
+    flushBullets();
+    if (line.trim()) {
+      out.push(
+        <p key={`p-${i}`} className="leading-relaxed">
+          {renderInline(line, `p-${i}`)}
+        </p>,
+      );
+    }
+  });
+  flushBullets();
+  return <div className="space-y-1.5 text-ink-900">{out}</div>;
+}
+
 function AskBody({
   onPick,
 }: {
@@ -374,32 +490,49 @@ function AskBody({
   const [answer, setAnswer] = useState<string | null>(null);
   const [cited, setCited] = useState<AskCitation[]>([]);
   const [err, setErr] = useState<string | null>(null);
+  const [turnstile, setTurnstile] = useState<{
+    sitekey: string;
+    pendingQuestion: string;
+  } | null>(null);
+  const turnstileRef = useRef<HTMLDivElement | null>(null);
+  const widgetIdRef = useRef<string | null>(null);
 
-  async function ask(text: string) {
+  async function ask(text: string, turnstileToken?: string) {
     if (!text.trim()) return;
     setLoading(true);
     setErr(null);
-    setAnswer(null);
-    setCited([]);
+    if (!turnstileToken) {
+      setAnswer(null);
+      setCited([]);
+    }
     try {
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ question: text }),
+        body: JSON.stringify({ question: text, turnstileToken }),
       });
-      if (!res.ok) {
-        setErr(`HTTP ${res.status}（本地 dev server 沒接 Worker，需部署到 CF 才能跑）`);
+      const data = (await res.json()) as {
+        answer?: string;
+        cited?: AskCitation[];
+        error?: string;
+        message?: string;
+        requireTurnstile?: boolean;
+        sitekey?: string;
+        retryAfterSec?: number;
+      };
+      if (res.status === 401 && data.requireTurnstile && data.sitekey) {
+        setTurnstile({ sitekey: data.sitekey, pendingQuestion: text });
+      } else if (res.status === 429) {
+        setErr(data.message ?? "查詢次數已達上限，請稍後再試。");
+      } else if (!res.ok) {
+        setErr(
+          data.error ??
+            `HTTP ${res.status}（dev server 沒接 Worker，需部署到 CF 才會通）`,
+        );
       } else {
-        const data = (await res.json()) as {
-          answer?: string;
-          cited?: AskCitation[];
-          error?: string;
-        };
-        if (data.error) setErr(data.error);
-        else {
-          setAnswer(data.answer ?? "");
-          setCited(data.cited ?? []);
-        }
+        setAnswer(data.answer ?? "");
+        setCited(data.cited ?? []);
+        setTurnstile(null); // clear any pending challenge
       }
     } catch (e) {
       setErr(String((e as Error).message));
@@ -407,6 +540,44 @@ function AskBody({
       setLoading(false);
     }
   }
+
+  // Render Turnstile widget when challenge fires
+  useEffect(() => {
+    if (!turnstile || !turnstileRef.current) return;
+    loadTurnstileScript();
+    let cancelled = false;
+    const tryRender = () => {
+      if (cancelled) return;
+      if (window.turnstile) {
+        if (widgetIdRef.current) {
+          try {
+            window.turnstile.remove(widgetIdRef.current);
+          } catch {
+            /* */
+          }
+        }
+        widgetIdRef.current = window.turnstile.render(turnstileRef.current!, {
+          sitekey: turnstile.sitekey,
+          theme: "light",
+          size: "normal",
+          callback: (token: string) => {
+            ask(turnstile.pendingQuestion, token);
+          },
+          "error-callback": () => {
+            setErr("驗證失敗，請重試");
+            setTurnstile(null);
+          },
+        });
+      } else {
+        setTimeout(tryRender, 200);
+      }
+    };
+    tryRender();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turnstile]);
 
   return (
     <div className="flex flex-col gap-2">
@@ -447,34 +618,26 @@ function AskBody({
           </button>
         ))}
       </div>
-      {(loading || answer || err || cited.length > 0) && (
-        <div className="max-h-60 overflow-auto rounded-md bg-ink-50 px-2 py-1.5 text-xs">
+      {turnstile && (
+        <div className="rounded-md border border-ai-500 bg-ai-50 px-2 py-1.5 text-xs">
+          <div className="mb-1 text-ink-600">為了防止濫用，請完成驗證：</div>
+          <div ref={turnstileRef} />
+        </div>
+      )}
+      {(loading || answer || err || cited.length > 0) && !turnstile && (
+        <div className="max-h-72 overflow-auto rounded-md bg-ink-50 px-2 py-1.5 text-xs">
           {loading && (
             <div className="text-ink-400">查詢中（CF 邊端 llama，2–5 秒）…</div>
           )}
           {err && <div className="text-radar-700">錯誤：{err}</div>}
           {answer && (
-            <div className="whitespace-pre-wrap leading-relaxed text-ink-900">
-              {answer}
-            </div>
+            <AnswerView text={answer} cited={cited} onPick={onPick} />
           )}
           {cited.length > 0 && (
-            <div className="mt-1 border-t border-ink-200 pt-1">
+            <div className="mt-2 border-t border-ink-200 pt-1">
               <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-ink-400">
-                引用 {cited.length} 點
+                引用 {cited.length} 點 (點 [id] 可定位)
               </div>
-              <ul className="space-y-0.5">
-                {cited.slice(0, 12).map((c) => (
-                  <li
-                    key={c.id}
-                    onClick={() => onPick(c.lat, c.lng)}
-                    className="cursor-pointer rounded px-1 text-[10px] hover:bg-white"
-                  >
-                    <span className="text-ink-400">[{c.id}]</span>{" "}
-                    <span className="text-ink-900">{c.address}</span>
-                  </li>
-                ))}
-              </ul>
             </div>
           )}
         </div>
