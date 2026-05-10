@@ -226,13 +226,39 @@ async function geocodeLandmark(
 }
 
 // Pull "可能是地名" tokens out of a query for geocoding fallback.
+//
+// Two-tier strategy:
+//   1) Suffix-anchored matches (XX橋, XX大道, XX路口, XX區, XX市, ...) — high
+//      confidence, place these first so they get geocoded first.
+//   2) If suffix-anchored yields nothing useful, fall back to bare 2-3 char
+//      Chinese sliding-window candidates. Most of those geocode-fail (噪訊),
+//      but place names like "淡水", "三芝", "公館", "西門" 等裸詞會命中。
+//      Caller should cap how many it actually tries against Nominatim.
 function extractLandmarks(q: string): string[] {
-  const out = new Set<string>();
-  const m = q.match(
-    /[一-鿿]{2,8}(?:橋|大道|路口|站|捷運|公園|大學|國小|國中|高中|體育場|百貨|車站)/g,
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (t: string) => {
+    if (t && !seen.has(t)) {
+      seen.add(t);
+      out.push(t);
+    }
+  };
+  // tier 1
+  const suffixed = q.match(
+    /[一-鿿]{2,8}(?:橋|大道|路口|站|捷運|公園|大學|國小|國中|高中|體育場|百貨|車站|區|市|鄉|鎮|縣|路)/g,
   );
-  m?.forEach((t) => out.add(t));
-  return [...out];
+  suffixed?.forEach(add);
+  // tier 2 — sliding 2-3 char windows over contiguous Chinese chunks.
+  // 2-char first since most TW place names are 2 chars (淡水/三芝/永和/北投/萬華).
+  const chineseChunks = q.match(/[一-鿿]+/g) ?? [];
+  for (let len = 2; len <= 3; len++) {
+    for (const chunk of chineseChunks) {
+      for (let i = 0; i + len <= chunk.length; i++) {
+        add(chunk.slice(i, i + len));
+      }
+    }
+  }
+  return out;
 }
 
 // ===== relevance pipeline =====
@@ -260,12 +286,19 @@ async function pickRelevantPoints(
     .map((p) => ({ p, s: scoreRelevance(p, kws) }))
     .sort((a, b) => b.s - a.s);
 
-  // If keyword search hit nothing, try geocoding ALL extracted landmarks and
-  // union by closest-distance to any of them.
+  // If keyword search hit nothing, try geocoding extracted landmarks (tier-1
+  // suffix-anchored first, then tier-2 bare 2/3-char chunks) and union by
+  // closest-distance to any successful coord. Cap Nominatim calls so noise
+  // tokens (速嗎, 有測…) don't blow up the latency.
   if (scored.length === 0 || scored[0].s === 0) {
     const landmarks = extractLandmarks(question);
     const coords: Array<{ lat: number; lng: number }> = [];
+    const MAX_GEOCODE_ATTEMPTS = 8;
+    const MAX_HITS = 3;
+    let attempts = 0;
     for (const lm of landmarks) {
+      if (attempts >= MAX_GEOCODE_ATTEMPTS || coords.length >= MAX_HITS) break;
+      attempts++;
       const c = await geocodeLandmark(lm);
       if (c) coords.push(c);
     }
