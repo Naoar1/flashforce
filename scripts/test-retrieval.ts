@@ -126,11 +126,11 @@ const COUNTY_SHORT = [
 ];
 
 const PARTICLES = new Set(
-  "我你妳他她它的了是也在有沒嗎呢吧啊喔哦得那這還想要去來玩看找問能會可嘛喲對於及與和從到經過往沿並既或而但則因為所以".split(""),
+  "我你妳他她它的了是也在有沒嗎呢吧啊喔哦得那這還想要去來玩看找問能會可嘛喲對於及與和從到經過往沿並既或而但則因為所以上下插起把將被讓且若如且各每某該本另就只僅僅但卻才其前後左右走行開騎坐騎跑騎乘搭".split(""),
 );
 
 const OFF_TOPIC_KEYWORDS = [
-  "食譜", "料理", "菜單", "美食", "餐廳", "怎麼煮", "怎麼做",
+  "食譜", "料理", "菜單", "美食", "餐廳", "怎麼煮", "怎麼做", "想煮", "煮飯",
   "總統", "政治", "選舉", "議員", "立委", "政黨", "市長", "縣長",
   "新聞", "八卦", "娛樂", "明星", "電影", "音樂", "歌曲", "歌詞",
   "天氣", "氣象", "下雨", "颱風", "溫度", "幾度",
@@ -242,10 +242,19 @@ function parseQuery(rawQuery: string): ParsedQuery {
   const cityHints = new Set<string>();
   for (const c of CITY_NAMES) if (q.includes(c)) cityHints.add(c);
   const districtHints = new Set<string>();
-  for (const m of q.matchAll(/([一-鿿]{1,3}[區鄉鎮市])/g)) {
-    const name = m[1];
-    if (CITY_NAMES.includes(name)) continue;
-    districtHints.add(name);
+  for (const m of q.matchAll(/([一-鿿]{1,3})(區|鄉|鎮|市)/g)) {
+    const full = m[1] + m[2];
+    if (CITY_NAMES.includes(full)) continue;
+    districtHints.add(full);
+  }
+  for (const m of q.matchAll(/([一-鿿]{2,3})(段|邊|側|頭|口|橋頭)/g)) {
+    const stem = m[1];
+    if (!districtStems.has(stem)) continue;
+    for (const suf of ["區", "鄉", "鎮", "市"]) {
+      const candidate = stem + suf;
+      if (CITY_NAMES.includes(candidate)) continue;
+      districtHints.add(candidate);
+    }
   }
   let speedLimit: number | null = null;
   const slMatch = q.match(/(?:速限|限速)\s*(\d{2,3})/);
@@ -293,7 +302,7 @@ function extractCoreChunks(rawQuery: string): string[] {
   for (const n of NOISE) cleaned = cleaned.split(n).join(" ");
   for (const f of FEATURE_FRAGMENTS) cleaned = cleaned.split(f).join(" ");
   for (const c of CITY_NAMES) cleaned = cleaned.split(c).join(" ");
-  cleaned = cleaned.replace(/[一-鿿]{1,3}[區鄉鎮市]/g, " ");
+  cleaned = cleaned.replace(/[一-鿿]{1,3}(?:區|鄉|鎮|市|段|邊|側|頭|口|橋頭)/g, " ");
   let stripped = "";
   for (const ch of cleaned) stripped += PARTICLES.has(ch) ? " " : ch;
   const out: string[] = [];
@@ -328,6 +337,13 @@ interface CanonicalPoint {
   blob: string;
   city: string;
   district: string;
+}
+
+type Bbox = [number, number, number, number];
+const BBOX_EXPAND = 0.03;
+
+function bboxContains(b: Bbox, lat: number, lng: number): boolean {
+  return lat >= b[0] && lat <= b[1] && lng >= b[2] && lng <= b[3];
 }
 
 interface RetrievalResult {
@@ -366,8 +382,20 @@ function pickRelevantPoints(
     if (filtered.length > 0) pool = filtered;
   }
   if (parsed.districtHints.length > 0) {
-    const filtered = pool.filter((x) => parsed.districtHints.includes(x.district));
-    if (filtered.length > 0) pool = filtered;
+    const exact = pool.filter((x) => parsed.districtHints.includes(x.district));
+    if (exact.length > 0) {
+      pool = exact;
+    } else {
+      const bboxes: Bbox[] = [];
+      for (const d of parsed.districtHints) {
+        const b = districtBbox.get(d);
+        if (b) bboxes.push(b);
+      }
+      if (bboxes.length > 0) {
+        const spatial = pool.filter((x) => bboxes.some((b) => bboxContains(b, x.p.lat, x.p.lng)));
+        if (spatial.length > 0) pool = spatial;
+      }
+    }
   }
   if (parsed.speedLimit !== null) {
     pool = pool.filter((x) => x.p.speedLimit === parsed.speedLimit);
@@ -386,7 +414,9 @@ function pickRelevantPoints(
     for (const t of parsed.grepTerms) if (blob.includes(t)) s += t.length;
     for (const rc of parsed.roadCodes) if (blob.includes(rc)) s += rc.length;
     if (s > 0) scored.push({ p, blob, s });
-    else if (filterActive && coreChunks.length === 0) scored.push({ p, blob, s: 1 });
+  }
+  if (scored.length === 0 && filterActive && coreChunks.length === 0) {
+    for (const { p, blob } of pool) scored.push({ p, blob, s: 1 });
   }
   scored.sort((a, b) => b.s - a.s);
   let top = scored.slice(0, topN);
@@ -415,6 +445,7 @@ function pickRelevantPoints(
     missingUserTokens.push(c);
     if (missingUserTokens.length >= 4) break;
   }
+  if (missingUserTokens.length > 0) top = top.slice(0, 5);
 
   const modeParts: string[] = [];
   if (parsed.intent.kindFilter) modeParts.push(`kind:${parsed.intent.kindFilter.join(",")}`);
@@ -449,6 +480,25 @@ const data: CanonicalPoint[] = bundle.points.map((p) => ({
   city: canonicalize(p.city),
   district: canonicalize(p.district ?? ""),
 }));
+const districtBbox = new Map<string, Bbox>();
+for (const x of data) {
+  if (!x.district) continue;
+  const b = districtBbox.get(x.district);
+  if (!b) districtBbox.set(x.district, [x.p.lat, x.p.lat, x.p.lng, x.p.lng]);
+  else {
+    b[0] = Math.min(b[0], x.p.lat); b[1] = Math.max(b[1], x.p.lat);
+    b[2] = Math.min(b[2], x.p.lng); b[3] = Math.max(b[3], x.p.lng);
+  }
+}
+for (const b of districtBbox.values()) {
+  b[0] -= BBOX_EXPAND; b[1] += BBOX_EXPAND;
+  b[2] -= BBOX_EXPAND; b[3] += BBOX_EXPAND;
+}
+const districtStems = new Set<string>();
+for (const d of districtBbox.keys()) {
+  const m = d.match(/^(.+?)(區|鄉|鎮|市)$/);
+  if (m && m[1].length >= 2) districtStems.add(m[1]);
+}
 
 // ---- Expectations + assertions ----
 interface Expect {
@@ -458,10 +508,11 @@ interface Expect {
   hasId?: string[];
   allCities?: string[];
   minCount?: number;
+  maxCount?: number;
   missing?: string[];
-  minTotalPool?: number; // pool count after filters (the "full count" answer)
+  minTotalPool?: number;
   maxTotalPool?: number;
-  allSpeedLimit?: number; // every returned point must have this speedLimit
+  allSpeedLimit?: number;
 }
 
 interface Case {
@@ -585,6 +636,91 @@ const CASES: Case[] = [
   { q: "桃園機場有測速嗎", why: "桃園 substring matches, 機場 might not", expect: { minCount: 1 } },
   // Specific bridge in 新竹/苗栗 etc.
   { q: "中正橋附近的科技執法", why: "intent tech + 中正橋 landmark missing-term", expect: { mode: "kind:tech" } },
+
+  // ===== Highway-segment queries (the bug class user just demonstrated) =====
+  // These rely on district-bbox spatial fallback for highway entries with empty district field.
+  { q: "國三中和段測速位置", why: "國道3 + 中和段 → bbox-filter 中和區 → 2 國道3 entries near km 38-39", expect: { mode: "roads:國道3", maxTotalPool: 10, minCount: 1 } },
+  { q: "中山高八堵", why: "alias 中山高 → 國道1; 八堵 in 七堵區 — but 八堵 is landmark, not district. Should at least return 國道1 + 八堵 in missing-terms", expect: { mode: "roads:國道1" } },
+  { q: "國一基隆段", why: "國道1 + 基隆段 → bbox-filter for 基隆市 districts", expect: { mode: "roads:國道1" } },
+  { q: "國道3木柵段", why: "國道3 + 木柵段 → 木柵區 bbox", expect: { mode: "roads:國道3" } },
+  { q: "國道5坪林段", why: "國道5 + 坪林段 → 坪林區 bbox", expect: { mode: "roads:國道5" } },
+  { q: "國道3新店段", why: "國道3 + 新店段 → 新店區 bbox", expect: { mode: "roads:國道3" } },
+
+  // ===== Grammar continuations (the 仰德大道上 bug class) =====
+  { q: "仰德大道上有什麼測速", why: "上 particle stripped; 仰德大道 → 4 entries; missing-terms should be []", expect: { hasId: ["fixed-905", "fixed-906", "fixed-907", "fixed-908"], minCount: 4 } },
+  { q: "走仰德大道下山要小心測速嗎", why: "走/下山 stripped; 仰德大道 entries", expect: { hasId: ["fixed-905"], minCount: 4 } },
+  { q: "上仰德大道前的測速點", why: "上/前 stripped", expect: { hasId: ["fixed-905"], minCount: 4 } },
+  { q: "插在哪 仰德大道", why: "插 stripped; 仰德大道", expect: { hasId: ["fixed-905"], minCount: 4 } },
+
+  // ===== Landmark missing → cap 5 + missing-terms =====
+  { q: "中正橋接水快有科技執法點嗎", why: "中正橋接 missing; sample cap=5; minimal LLM context", expect: { mode: "kind:tech", missing: ["中正橋接"], maxCount: 5 } },
+  { q: "華江橋有測速嗎", why: "華江橋 likely missing in data; cap 5", expect: {} },
+  { q: "西門町測速", why: "西門町 missing in data; refuse / cap", expect: {} },
+  { q: "墾丁有測速嗎", why: "墾丁 has 0 entries; should be empty", expect: { empty: true } },
+  { q: "九份附近的測速", why: "九份 has 0 entries; empty", expect: { empty: true } },
+
+  // ===== Place colloquials with various phrasings =====
+  { q: "我要去淡水玩有測速嗎", why: "particles strip 我/要/去/玩; 淡水", expect: { minCount: 5 } },
+  { q: "今天從汐止上班會經過測速", why: "汐止 in addresses; today/work-context stripped", expect: { minCount: 1, allCities: ["新北市"] } },
+  { q: "竹科上下班有測速嗎", why: "alias 竹科 → 竹北/東區", expect: { allCities: ["新竹縣", "新竹市"] } },
+  { q: "從南港到內湖要注意測速嗎", why: "南港 + 內湖 substrings; both have entries", expect: { minCount: 1 } },
+
+  // ===== District forms (with/without 區) =====
+  { q: "中和區的測速點", why: "explicit 中和區; district filter", expect: { allCities: ["新北市"] } },
+  { q: "中和的測速點", why: "中和 substring (no 區/段); not strict but should hit 中和", expect: { minCount: 1 } },
+  { q: "中和邊有測速嗎", why: "中和邊 → 中和區 hint", expect: { allCities: ["新北市"] } },
+  { q: "板橋有幾個測速", why: "板橋 substring", expect: { minCount: 1 } },
+
+  // ===== Speed limit + road =====
+  { q: "台61速限80的點", why: "台61 + speedLimit 80", expect: { mode: "roads:台61 speed:80", allSpeedLimit: 80 } },
+  { q: "速限50的科技執法", why: "tech + speedLimit 50; might be 0 if no tech has 50", expect: { mode: "speed:50" } },
+
+  // ===== Total / count queries =====
+  { q: "全台共有幾個固定測速", why: "intent fixed → pool 1800+", expect: { mode: "kind:fixed", minTotalPool: 1800 } },
+  { q: "所有科技執法總計", why: "intent tech, total query", expect: { mode: "kind:tech", minTotalPool: 800 } },
+  { q: "區間測速一共幾個", why: "區間 intent; pool ~30+", expect: { mode: "type:區間", minTotalPool: 30 } },
+
+  // ===== Polite / verbose phrasings =====
+  { q: "請問一下汐止那邊有什麼科技執法呢", why: "請問/一下/那邊/呢 stripped; 汐止 + tech", expect: { mode: "kind:tech", allCities: ["新北市"] } },
+  { q: "可以告訴我國道3號的測速嗎", why: "可以/告訴我 stripped; 國道3 alias", expect: { mode: "roads:國道3", minCount: 10 } },
+  { q: "幫我查一下台9線速限", why: "幫我/查一下 stripped; 台9", expect: { mode: "roads:台9", minCount: 10 } },
+
+  // ===== Direction phrasings (no direction filter; should still list relevant) =====
+  { q: "南港到木柵北上方向測速", why: "南港+木柵+方向 'north'; we don't filter direction strictly", expect: { minCount: 1 } },
+
+  // ===== Edge inputs =====
+  { q: "?", why: "single punctuation; empty", expect: { empty: true } },
+  { q: "...", why: "ellipsis; empty", expect: { empty: true } },
+  { q: "速限速限速限", why: "all noise; empty", expect: { empty: true } },
+  { q: "測速測速測速", why: "STRIP_PHRASES eliminates; empty", expect: { empty: true } },
+
+  // ===== Off-topic variants =====
+  { q: "今晚我想煮義大利麵", why: "煮 / 義大利麵 / 怎麼煮-adjacent; food off-topic", expect: { offTopic: true } },
+  { q: "現任美國總統是誰", why: "politics off-topic", expect: { offTopic: true } },
+  { q: "明天會下雨嗎", why: "weather off-topic", expect: { offTopic: true } },
+
+  // ===== Highway 國道N + 縣市 combos (multi-stage filter) =====
+  { q: "桃園境內國道3號有幾個", why: "國道3 + 桃園 cityHint; bbox fallback to 桃園 districts", expect: { mode: "roads:國道3" } },
+  { q: "新北市的國道1號測速", why: "國道1 + 新北市; bbox fallback to 新北 districts", expect: { mode: "roads:國道1" } },
+
+  // ===== Verbatim user-typed queries from production failure session =====
+  // These are the three queries the user found broken on commit 44fc9ac;
+  // adding them verbatim so they remain green and any regression is caught.
+  {
+    q: "仰德大道上陽明山測速點插在哪裡",
+    why: "alias 陽明山 (substrs 仰德/陽明山, city 台北市) + 仰德大道 token; particles 上/插/在 strip; should return 4+ 仰德大道 entries",
+    expect: { allCities: ["台北市"], hasId: ["fixed-908"], minCount: 4, missing: [] },
+  },
+  {
+    q: "中正橋接水快有科技執法點嗎",
+    why: "alias 水快 (cities 台北市/新北市) + intent 科技執法; 中正橋接 missing → cap 5",
+    expect: { mode: "kind:tech", missing: ["中正橋接"], maxCount: 5, allCities: ["台北市", "新北市"] },
+  },
+  {
+    q: "國三中和段測速位置",
+    why: "國道3 + 中和段 → bbox 中和區 → 2 國道3 entries",
+    expect: { mode: "roads:國道3", minCount: 1, maxCount: 5 },
+  },
 ];
 
 // ---- Runner ----
@@ -595,6 +731,7 @@ const failures: string[] = [];
 for (const c of CASES) {
   let ok = true;
   const reasons: string[] = [];
+
 
 
 
@@ -621,6 +758,10 @@ for (const c of CASES) {
       if (c.expect.minCount && r.points.length < c.expect.minCount) {
         ok = false;
         reasons.push(`only ${r.points.length} points (need ${c.expect.minCount})`);
+      }
+      if (c.expect.maxCount !== undefined && r.points.length > c.expect.maxCount) {
+        ok = false;
+        reasons.push(`${r.points.length} points exceeds maxCount ${c.expect.maxCount}`);
       }
       if (c.expect.hasId) {
         const ids = new Set(r.points.map((p) => p.id));

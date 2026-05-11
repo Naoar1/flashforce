@@ -200,14 +200,14 @@ const COUNTY_SHORT = [
 // computing the "core landmark" of a query so windowed grammar artifacts
 // don't masquerade as user-typed landmarks.
 const PARTICLES = new Set(
-  "我你妳他她它的了是也在有沒嗎呢吧啊喔哦得那這還想要去來玩看找問能會可嘛喲對於及與和從到經過往沿並既或而但則因為所以".split(""),
+  "我你妳他她它的了是也在有沒嗎呢吧啊喔哦得那這還想要去來玩看找問能會可嘛喲對於及與和從到經過往沿並既或而但則因為所以上下插起把將被讓且若如且各每某該本另就只僅僅但卻才其前後左右走行開騎坐騎跑騎乘搭".split(""),
 );
 
 // ===== off-topic gate =====
 // Hard cut before LLM. Anything matching one of these returns a fixed
 // refusal — no point retrieval, no AI call.
 const OFF_TOPIC_KEYWORDS = [
-  "食譜", "料理", "菜單", "美食", "餐廳", "怎麼煮", "怎麼做",
+  "食譜", "料理", "菜單", "美食", "餐廳", "怎麼煮", "怎麼做", "想煮", "煮飯",
   "總統", "政治", "選舉", "議員", "立委", "政黨", "市長", "縣長",
   "新聞", "八卦", "娛樂", "明星", "電影", "音樂", "歌曲", "歌詞",
   "天氣", "氣象", "下雨", "颱風", "溫度", "幾度",
@@ -220,7 +220,7 @@ function isOffTopic(q: string): boolean {
   return OFF_TOPIC_KEYWORDS.some((k) => q.includes(k));
 }
 
-// ===== data cache (with canonicalised blob per point) =====
+// ===== data cache (with canonicalised blob per point + admin bboxes) =====
 interface CanonicalPoint {
   p: EnforcementPoint;
   blob: string; // canonical lowercase blob for substring matching
@@ -228,8 +228,17 @@ interface CanonicalPoint {
   district: string; // canonical district for strict admin matching
 }
 
+type Bbox = [number, number, number, number]; // [south, north, west, east]
+
 let cachedBundle: DataBundle | null = null;
 let cachedCanonical: CanonicalPoint[] | null = null;
+let cachedDistrictBbox: Map<string, Bbox> | null = null;
+let cachedDistrictStems: Set<string> | null = null;
+
+// Expansion when treating point cluster as area-of-interest (≈ 3.3 km on a
+// side at TW latitude). Highway entries usually pass close to a district's
+// city-road cluster, so this catches them without bleeding too far.
+const BBOX_EXPAND = 0.03;
 
 async function getCanonical(env: Env, request: Request): Promise<CanonicalPoint[]> {
   if (cachedCanonical) return cachedCanonical;
@@ -247,7 +256,41 @@ async function getCanonical(env: Env, request: Request): Promise<CanonicalPoint[
     city: canonicalize(p.city),
     district: canonicalize(p.district ?? ""),
   }));
+  // Compute one bbox per district from its city-road points. Highway entries
+  // (which have empty district) get matched into a district by spatial
+  // containment in this bbox later.
+  const bbox = new Map<string, Bbox>();
+  for (const x of cachedCanonical) {
+    if (!x.district) continue;
+    const b = bbox.get(x.district);
+    if (!b) {
+      bbox.set(x.district, [x.p.lat, x.p.lat, x.p.lng, x.p.lng]);
+    } else {
+      b[0] = Math.min(b[0], x.p.lat);
+      b[1] = Math.max(b[1], x.p.lat);
+      b[2] = Math.min(b[2], x.p.lng);
+      b[3] = Math.max(b[3], x.p.lng);
+    }
+  }
+  for (const b of bbox.values()) {
+    b[0] -= BBOX_EXPAND; b[1] += BBOX_EXPAND;
+    b[2] -= BBOX_EXPAND; b[3] += BBOX_EXPAND;
+  }
+  cachedDistrictBbox = bbox;
+  // Build district-stem set (district name minus 區/鄉/鎮/市) so the
+  // X-suffix district regex (中和段 / 後龍鎮邊 / etc.) only fires for real
+  // place stems, not for sentence fragments like "汐止那邊".
+  const stems = new Set<string>();
+  for (const d of bbox.keys()) {
+    const m = d.match(/^(.+?)(區|鄉|鎮|市)$/);
+    if (m && m[1].length >= 2) stems.add(m[1]);
+  }
+  cachedDistrictStems = stems;
   return cachedCanonical;
+}
+
+function bboxContains(b: Bbox, lat: number, lng: number): boolean {
+  return lat >= b[0] && lat <= b[1] && lng >= b[2] && lng <= b[3];
 }
 
 // ===== intent =====
@@ -376,13 +419,27 @@ function parseQuery(rawQuery: string): ParsedQuery {
   // City names typed directly in the query become strict admin filters.
   for (const c of CITY_NAMES) if (q.includes(c)) cityHints.add(c);
 
-  // District-level filter — pattern like 中和區 / 淡水區 / 東區 / 金城鎮.
+  // District-level filter — patterns:
+  //   X{區/鄉/鎮/市}  : direct district name (中和區, 後龍鎮)
+  //   X{段/邊/側/頭/口/橋頭} : landmark suffix; X is a place stem that we
+  //     map to all common district forms (中和段 → 中和區/中和鄉/中和鎮)
   // Excludes anything already captured as a city.
   const districtHints = new Set<string>();
-  for (const m of q.matchAll(/([一-鿿]{1,3}[區鄉鎮市])/g)) {
-    const name = m[1];
-    if (CITY_NAMES.includes(name)) continue;
-    districtHints.add(name);
+  for (const m of q.matchAll(/([一-鿿]{1,3})(區|鄉|鎮|市)/g)) {
+    const full = m[1] + m[2];
+    if (CITY_NAMES.includes(full)) continue;
+    districtHints.add(full);
+  }
+  for (const m of q.matchAll(/([一-鿿]{2,3})(段|邊|側|頭|口|橋頭)/g)) {
+    const stem = m[1];
+    // Reject fragment stems like 汐止那 / 高雄市 that aren't real place
+    // stems. Only allow stems that appear in our district set.
+    if (!cachedDistrictStems || !cachedDistrictStems.has(stem)) continue;
+    for (const suf of ["區", "鄉", "鎮", "市"]) {
+      const candidate = stem + suf;
+      if (CITY_NAMES.includes(candidate)) continue;
+      districtHints.add(candidate);
+    }
   }
 
   // Speed-limit filter — "速限60" / "限速 60" → strict speedLimit === 60.
@@ -445,8 +502,9 @@ function extractCoreChunks(rawQuery: string): string[] {
   for (const n of NOISE) cleaned = cleaned.split(n).join(" ");
   for (const f of FEATURE_FRAGMENTS) cleaned = cleaned.split(f).join(" ");
   for (const c of CITY_NAMES) cleaned = cleaned.split(c).join(" ");
-  // Strip district patterns (X區/X鄉/X鎮/X市)
-  cleaned = cleaned.replace(/[一-鿿]{1,3}[區鄉鎮市]/g, " ");
+  // Strip district / segment / side patterns so the stem + admin suffix
+  // doesn't reappear as a leftover landmark "missing-terms" entry.
+  cleaned = cleaned.replace(/[一-鿿]{1,3}(?:區|鄉|鎮|市|段|邊|側|頭|口|橋頭)/g, " ");
   let stripped = "";
   for (const ch of cleaned) stripped += PARTICLES.has(ch) ? " " : ch;
   const out: string[] = [];
@@ -525,10 +583,26 @@ function pickRelevantPoints(
     if (filtered.length > 0) pool = filtered;
   }
   if (parsed.districtHints.length > 0) {
-    const filtered = pool.filter((x) =>
-      parsed.districtHints.includes(x.district),
-    );
-    if (filtered.length > 0) pool = filtered;
+    // Try exact district-field match first (covers city-road points).
+    const exact = pool.filter((x) => parsed.districtHints.includes(x.district));
+    if (exact.length > 0) {
+      pool = exact;
+    } else if (cachedDistrictBbox) {
+      // No exact match — fall back to spatial bbox containment so highway
+      // entries (district field empty, only km in address) get matched via
+      // the lat/lng of the district's city-road cluster.
+      const bboxes: Bbox[] = [];
+      for (const d of parsed.districtHints) {
+        const b = cachedDistrictBbox.get(d);
+        if (b) bboxes.push(b);
+      }
+      if (bboxes.length > 0) {
+        const spatial = pool.filter((x) =>
+          bboxes.some((b) => bboxContains(b, x.p.lat, x.p.lng)),
+        );
+        if (spatial.length > 0) pool = spatial;
+      }
+    }
   }
   if (parsed.speedLimit !== null) {
     pool = pool.filter((x) => x.p.speedLimit === parsed.speedLimit);
@@ -548,18 +622,24 @@ function pickRelevantPoints(
     let s = 0;
     for (const t of parsed.grepTerms) if (blob.includes(t)) s += t.length;
     for (const rc of parsed.roadCodes) if (blob.includes(rc)) s += rc.length;
-    if (s > 0) {
-      scored.push({ p, blob, s });
-    } else if (filterActive && coreChunks.length === 0) {
-      // User narrowed via intent / road / city / alias only — no real
-      // landmark in the query (e.g. "闖紅燈在哪裡多", "南橫速限"). Every
-      // pool row already satisfies the filter; rank arbitrarily so the
-      // LLM gets the full set.
-      scored.push({ p, blob, s: 1 });
-    }
+    if (s > 0) scored.push({ p, blob, s });
+  }
+  // Fallback ONLY when no entry matched any grep term. If even one entry
+  // matched, we trust the grep signal and don't dilute with score-1 noise.
+  if (scored.length === 0 && filterActive && coreChunks.length === 0) {
+    for (const { p, blob } of pool) scored.push({ p, blob, s: 1 });
   }
   scored.sort((a, b) => b.s - a.s);
   let top = scored.slice(0, topN);
+
+  // When the user typed a specific landmark that doesn't appear in any
+  // cited blob, the listing is "approximate" by definition. Cap to a small
+  // number so the LLM frames it as a hint, not as N answers to the user's
+  // exact question.
+  // (This is intentionally before missingUserTokens computation so the
+  // cap reflects the capped set.)
+  // We use a placeholder that the caller can override below after we know
+  // the missingUserTokens. So we keep `top` full here and trim later.
 
   // Specificity gate — pure-grep mode only (no intent / road / alias). The
   // gate compares the query's *core chunks* (post-strip of intent / NOISE /
@@ -593,6 +673,12 @@ function pickRelevantPoints(
     if (missingUserTokens.includes(c)) continue;
     missingUserTokens.push(c);
     if (missingUserTokens.length >= 4) break;
+  }
+  // If a real user-typed landmark went unmatched, cap the listing to 5 so
+  // the LLM frames remaining points as approximations rather than as N
+  // direct hits.
+  if (missingUserTokens.length > 0) {
+    top = top.slice(0, 5);
   }
 
   const modeParts: string[] = [];
@@ -655,7 +741,7 @@ const SYSTEM_PROMPT = `你是 FlashForce 的查詢助手。FlashForce 是台灣�
 1. 只能引用清單裡實際出現的 [id]，逐字對應，不可自創。
 2. 不要編造速限、方向、子分類、路線、行政區、地點等任何欄位。清單沒寫就不要寫。
 3. 不要做出資料中沒有明確顯示的等價聲明（不要說「南迴=國道3」「中山高=國道5」之類）。如果清單裡的點本身有路線編號，就用清單上的；沒有就只引用地址。
-4. 「missing-terms」欄位（若有）列出 user 提到、但清單中沒有任何點包含的詞。**遇到時：在回答最前面誠實說「資料庫沒看到 \`X\` 相關的點」**，再列出清單裡實際有的相關點作參考。不要把附近不相干的點冒充成 user 問的位置。
+4. 「missing-terms」欄位（若有）列出 user 提到、但清單中沒有任何點包含的詞。**遇到時：第一句明說「資料庫沒收錄 \`X\` 相關的點」**。清單已經由系統 cap 到最多 5 點，這些點與 user 的精確地點不一致，**只列前 3 個**並且要**標明「最接近的點如下（不是 X 本身）」**。不要把這些點當成 user 問的位置回答。如果 user 沒問計數，可以完全不列；簡短的拒絕＋建議「請改用其他關鍵字」就夠。
 5. 「pool-total」是符合過濾條件的點位總數。**清單只列前 30 個樣本**。若 user 問「總共幾個 / 全部 / 多少」**請使用 pool-total，明確說明「共 N 個，這裡列前 30」**。不要把 30 當總數回答。
 6. 「km-hints」是 user 提到的公里數（如「100公里」「100K」）。清單中每個點的地址通常含 \`XXX公里\` 或 \`XX.XK\` 標記，**請只列出與 user km 相近的點**（±5K 內）；其它請過濾掉，或註明「其他段不在你問的範圍」。
 7. 多 landmark 路徑題（例如 "從八里經台61到後龍"）：每點地址的 km 標記指出位置，**只列在 user 路徑 km 範圍內的點**。例如八里 ~ 後龍對應 \`台61\` 約 0–110K，143K 的點不在路徑上，要排除或明說。
