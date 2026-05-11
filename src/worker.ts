@@ -1,16 +1,22 @@
 /**
- * FlashForce Cloudflare Worker — handles /api/ask (NL Q&A) and falls
- * through everything else to static assets (the Next.js out/).
+ * FlashForce Cloudflare Worker — /api/ask handler + static asset passthrough.
  *
- * Architecture (RAG):
- *   1) expand colloquial abbreviations  (水快 → 水源快速道路)
- *   2) detect intent  (區間 / 闖紅燈 / 機動 / 違停 / 不停讓 / 固定)
- *   3) keyword-rank candidates with intent filter applied
- *   4) if zero hits, geocode landmark via Nominatim → radius search
- *   5) ALWAYS pass top-N to the LLM (no zero-match short-circuit; the LLM
- *      decides whether anything is relevant; this matters for fuzzy queries)
- *   6) Workers AI llama-3.3-70b answers grounded in retrieved set, with
- *      few-shot system prompt enforcing format.
+ * Architecture (geographic-first, no alias dict, no runtime LLM rewrite):
+ *
+ *   parse        — extract intent (區間/闖紅燈/...) + road codes (台N/國道N) +
+ *                  remaining Chinese geo tokens via regex (no dictionary)
+ *   resolve      — for each geo token, query Nominatim (cached) and keep the
+ *                  top 1-2 places (each gives name + bbox + center)
+ *   score        — filter pool by intent + road code; score each remaining
+ *                  point by (bbox-contains, distance-to-center, road-code
+ *                  substring); take top-N
+ *   answer       — single llama-3.3-70b call grounded on the retrieved points
+ *
+ * Knowledge source is OSM (via Nominatim). No hand-curated alias map —
+ * coverage of "淡水", "淡江", "汐科", "西濱", "北宜公路" etc. comes from OSM's
+ * place / alt_name / industrial / school / way tagging. Tokens OSM doesn't
+ * resolve simply fail loudly (LLM refuses politely) rather than silently
+ * masquerading as the wrong place.
  */
 /// <reference types="@cloudflare/workers-types" />
 
@@ -49,7 +55,7 @@ interface DataBundle {
   points: EnforcementPoint[];
 }
 
-// ===== module-scope cache =====
+// ===== module-scope data cache =====
 let cachedBundle: DataBundle | null = null;
 async function getBundle(env: Env, request: Request): Promise<DataBundle> {
   if (cachedBundle) return cachedBundle;
@@ -60,111 +66,212 @@ async function getBundle(env: Env, request: Request): Promise<DataBundle> {
   return cachedBundle;
 }
 
-// ===== abbreviation expansion =====
-//
-// Taiwanese drivers heavily abbreviate road names. Without expansion, "水快"
-// never grep-matches "水源快速道路" in our address fields. This map is
-// extensible; add more pairs as user feedback shows misses.
-const ABBREV: Record<string, string[]> = {
-  水快: ["水源快速道路", "水源快速", "水源路"],
-  環快: ["環河快速道路", "環河南路", "環河北路", "環河西路", "環河東路"],
-  北快: ["市民大道", "市民高架"],
-  南快: ["信義快速道路", "信義路"],
-  建快: ["建國高架", "建國北路", "建國南路"],
-  // 國/省道暱稱
-  國一: ["國道1號", "國道一號"],
-  國二: ["國道2號", "國道二號"],
-  國三: ["國道3號", "國道三號"],
-  國四: ["國道4號", "國道四號"],
-  國五: ["國道5號", "國道五號"],
-  國六: ["國道6號", "國道六號"],
-  國八: ["國道8號", "國道八號"],
-  國十: ["國道10號", "國道十號"],
-  // 區域
-  陽明山: ["陽明山", "士林區", "北投區"],
-  天母: ["士林區", "天母"],
-  公館: ["中正區", "公館"],
-};
-
-function expandQuery(q: string): string {
-  let expanded = q;
-  for (const [abbr, fulls] of Object.entries(ABBREV)) {
-    if (q.includes(abbr)) {
-      expanded += " " + fulls.join(" ");
-    }
-  }
-  return expanded;
-}
-
-// ===== intent detection =====
-//
-// When the user mentions a specific subcategory, we filter the candidate pool
-// to that subset BEFORE keyword scoring; otherwise a query like "台64 區間限速"
-// returns 4 fixed-point speed cameras + 3 真區間 mixed together, confusing the
-// model.
+// ===== intent detection (kind / enforcementType) =====
 interface QueryIntent {
   kindFilter?: EnforcementPoint["kind"][];
   enforcementTypeContains?: string[];
 }
 
 function detectIntent(q: string): QueryIntent {
-  const intent: QueryIntent = {};
-  // subcategory keywords → narrow to tech kind + specific enforcementType
   if (q.includes("區間")) {
-    intent.kindFilter = ["tech"];
-    intent.enforcementTypeContains = ["區間"];
-  } else if (q.includes("闖紅燈")) {
-    intent.kindFilter = ["tech"];
-    intent.enforcementTypeContains = ["闖紅燈"];
-  } else if (q.includes("違停") || q.includes("違規停車")) {
-    intent.kindFilter = ["tech"];
-    intent.enforcementTypeContains = ["違停", "違規停車", "違規(臨時)停車"];
-  } else if (q.includes("不停讓") || q.includes("禮讓行人")) {
-    intent.kindFilter = ["tech"];
-    intent.enforcementTypeContains = ["不停讓", "未禮讓"];
-  } else if (q.includes("跨越雙白") || q.includes("跨越雙黃")) {
-    intent.kindFilter = ["tech"];
-    intent.enforcementTypeContains = ["跨越"];
-  } else if (q.includes("機動")) {
-    intent.kindFilter = ["mobile"];
-  } else if (q.includes("固定測速")) {
-    intent.kindFilter = ["fixed"];
+    return { kindFilter: ["tech"], enforcementTypeContains: ["區間"] };
   }
-  return intent;
-}
-
-// ===== keyword extraction =====
-function extractKeywords(q: string): string[] {
-  const tokens = new Set<string>();
-  const chinese = q.match(
-    /[一-鿿]{2,8}(?:路|大道|街|巷|橋|快速|快道|公路|交流道|隧道|區|市|鄉|鎮|縣|快速道路)/g,
-  );
-  chinese?.forEach((t) => tokens.add(t));
-  const routes = q.match(
-    /[國省](?:道)?\s*[\d一二三四五六七八九十]+|[台臺]\s*\d+(?:甲|乙|丙|丁)?|[Ff][沿縣]?道?\s*\d+/g,
-  );
-  routes?.forEach((t) => tokens.add(t.replace(/\s+/g, "")));
-  const landmarks = q.match(
-    /[一-鿿]{2,10}(?:大樓|公園|大學|國小|國中|高中|捷運|火車站|體育場|醫院|百貨)/g,
-  );
-  landmarks?.forEach((t) => tokens.add(t));
-  // bare 2-4 char chunks as fallback
-  const bare = q.match(/[一-鿿]{2,4}/g);
-  bare?.slice(0, 8).forEach((t) => tokens.add(t));
-  return [...tokens];
-}
-
-function scoreRelevance(point: EnforcementPoint, keywords: string[]): number {
-  let s = 0;
-  const blob =
-    `${point.city} ${point.district} ${point.address} ${point.enforcementType ?? ""}`.toLowerCase();
-  for (const kw of keywords) {
-    if (blob.includes(kw.toLowerCase())) s += kw.length;
+  if (q.includes("闖紅燈")) {
+    return { kindFilter: ["tech"], enforcementTypeContains: ["闖紅燈"] };
   }
-  return s;
+  if (q.includes("違停") || q.includes("違規停車")) {
+    return {
+      kindFilter: ["tech"],
+      enforcementTypeContains: ["違停", "違規停車", "違規(臨時)停車"],
+    };
+  }
+  if (q.includes("不停讓") || q.includes("禮讓行人")) {
+    return {
+      kindFilter: ["tech"],
+      enforcementTypeContains: ["不停讓", "未禮讓"],
+    };
+  }
+  if (q.includes("跨越雙白") || q.includes("跨越雙黃")) {
+    return { kindFilter: ["tech"], enforcementTypeContains: ["跨越"] };
+  }
+  if (q.includes("機動")) return { kindFilter: ["mobile"] };
+  if (q.includes("固定測速")) return { kindFilter: ["fixed"] };
+  return {};
 }
 
-// ===== Haversine distance (meters) =====
+// ===== parse query =====
+interface ParsedQuery {
+  intent: QueryIntent;
+  roadCodes: string[]; // "台61", "國道5", etc. — also includes both 台/臺 variants
+  geoTokens: string[]; // chunks for Nominatim resolution
+}
+
+function parseQuery(q: string): ParsedQuery {
+  const intent = detectIntent(q);
+
+  // Road codes
+  const codes = new Set<string>();
+  // 國道N / 國N
+  for (const m of q.matchAll(/國(?:道)?\s*(\d{1,2})/g)) {
+    codes.add(`國道${m[1]}號`);
+    codes.add(`國道${m[1]}`);
+  }
+  // 台N / 臺N (+optional 甲乙丙丁)
+  for (const m of q.matchAll(/[台臺]\s*(\d{1,3})\s*(甲|乙|丙|丁)?/g)) {
+    const suf = m[2] ?? "";
+    codes.add(`台${m[1]}${suf}線`);
+    codes.add(`臺${m[1]}${suf}線`);
+    codes.add(`台${m[1]}${suf}`);
+    codes.add(`臺${m[1]}${suf}`);
+  }
+  // 縣道N
+  for (const m of q.matchAll(/縣道\s*(\d{1,3})/g)) {
+    codes.add(`縣道${m[1]}`);
+  }
+
+  // Geo tokens — strip out road-code spans first so we don't re-tokenize them
+  const cleaned = q
+    .replace(/國(?:道)?\s*\d{1,2}(?:號)?/g, " ")
+    .replace(/[台臺]\s*\d{1,3}(?:甲|乙|丙|丁)?(?:線|號)?/g, " ")
+    .replace(/縣道\s*\d{1,3}/g, " ");
+
+  const tokenSet = new Set<string>();
+  // Tier 1: suffix-anchored landmarks / admin areas (higher signal)
+  const suffixed = cleaned.match(
+    /[一-鿿]{2,8}(?:區|市|鄉|鎮|縣|村|里|大道|路|街|巷|橋|快速道路|快速|公路|交流道|隧道|大學|車站|捷運|園區|路口|商圈|夜市|公園|機場)/g,
+  );
+  suffixed?.forEach((t) => tokenSet.add(t));
+  // Tier 2: bare 2-4 char Chinese chunks (for short colloquials like 汐科, 淡江)
+  const bare = cleaned.match(/[一-鿿]{2,4}/g);
+  bare?.forEach((t) => tokenSet.add(t));
+
+  // Drop pure-interrogative / common noise chunks
+  const NOISE = new Set([
+    "什麼",
+    "幾處",
+    "幾個",
+    "哪裡",
+    "哪邊",
+    "哪些",
+    "如何",
+    "怎樣",
+    "怎麼",
+    "多少",
+    "嗎",
+    "呢",
+    "嘛",
+    "有沒",
+    "沒有",
+    "速限",
+    "限速",
+    "最低",
+    "最高",
+    "最快",
+    "最慢",
+    "範圍",
+    "附近",
+    "周遭",
+    "周邊",
+    "資料",
+    "點位",
+    "測速",
+    "科技",
+    "執法",
+    "機動",
+    "固定",
+    "罰單",
+    "取締",
+    "違規",
+    "拍照",
+    "照相",
+  ]);
+  for (const t of [...tokenSet]) {
+    if (NOISE.has(t)) tokenSet.delete(t);
+  }
+
+  return {
+    intent,
+    roadCodes: [...codes],
+    geoTokens: [...tokenSet],
+  };
+}
+
+// ===== Nominatim resolver (cached) =====
+interface ResolvedPlace {
+  query: string;
+  name: string;
+  bbox: [number, number, number, number] | null; // [south, north, west, east]
+  center: { lat: number; lng: number };
+  importance: number;
+}
+
+const placeCache = new Map<string, ResolvedPlace[]>();
+let lastNominatimAt = 0;
+const NOMINATIM_RATE_MS = 1100;
+
+async function nominatimRateLimit() {
+  const now = Date.now();
+  const wait = lastNominatimAt + NOMINATIM_RATE_MS - now;
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastNominatimAt = Date.now();
+}
+
+async function resolveToken(token: string): Promise<ResolvedPlace[]> {
+  if (placeCache.has(token)) return placeCache.get(token)!;
+  if (placeCache.size > 2000) placeCache.clear();
+
+  await nominatimRateLimit();
+  try {
+    const url = new URL("https://nominatim.openstreetmap.org/search");
+    url.searchParams.set("q", token);
+    url.searchParams.set("countrycodes", "tw");
+    url.searchParams.set("format", "json");
+    url.searchParams.set("limit", "2");
+    url.searchParams.set("accept-language", "zh-TW");
+    const res = await fetch(url.toString(), {
+      headers: { "User-Agent": "FlashForce/1.0 (+github.com/Naoar1/flashforce)" },
+    });
+    if (!res.ok) {
+      placeCache.set(token, []);
+      return [];
+    }
+    const data = (await res.json()) as Array<{
+      lat: string;
+      lon: string;
+      display_name: string;
+      importance?: number;
+      boundingbox?: [string, string, string, string];
+    }>;
+    const out: ResolvedPlace[] = [];
+    for (const r of data) {
+      const lat = Number.parseFloat(r.lat);
+      const lng = Number.parseFloat(r.lon);
+      if (!inTaiwan(lat, lng)) continue;
+      let bbox: ResolvedPlace["bbox"] = null;
+      if (r.boundingbox) {
+        const [s, n, w, e] = r.boundingbox.map((x) => Number.parseFloat(x));
+        if ([s, n, w, e].every(Number.isFinite)) bbox = [s, n, w, e];
+      }
+      out.push({
+        query: token,
+        name: r.display_name,
+        bbox,
+        center: { lat, lng },
+        importance: r.importance ?? 0,
+      });
+    }
+    placeCache.set(token, out);
+    return out;
+  } catch {
+    placeCache.set(token, []);
+    return [];
+  }
+}
+
+function inTaiwan(lat: number, lng: number): boolean {
+  return lat >= 21 && lat <= 26.5 && lng >= 118 && lng <= 122.5;
+}
+
 function distMeters(
   a: { lat: number; lng: number },
   b: { lat: number; lng: number },
@@ -181,151 +288,109 @@ function distMeters(
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
-// ===== landmark geocoding via Nominatim =====
-//
-// Module-scope LRU-ish cache (max 100). Cleared on each isolate restart.
-const geoCache = new Map<string, { lat: number; lng: number } | null>();
-
-async function geocodeLandmark(
-  q: string,
-): Promise<{ lat: number; lng: number } | null> {
-  if (geoCache.has(q)) return geoCache.get(q) ?? null;
-  if (geoCache.size > 100) geoCache.clear();
-  try {
-    const url = new URL("https://nominatim.openstreetmap.org/search");
-    url.searchParams.set("q", q);
-    url.searchParams.set("countrycodes", "tw");
-    url.searchParams.set("format", "json");
-    url.searchParams.set("limit", "1");
-    url.searchParams.set("accept-language", "zh-TW");
-    const res = await fetch(url.toString(), {
-      headers: { "User-Agent": "FlashForce/1.0 (+github.com/Naoar1/flashforce)" },
-    });
-    if (!res.ok) {
-      geoCache.set(q, null);
-      return null;
-    }
-    const arr = (await res.json()) as Array<{ lat: string; lon: string }>;
-    if (!arr.length) {
-      geoCache.set(q, null);
-      return null;
-    }
-    const lat = Number.parseFloat(arr[0].lat);
-    const lng = Number.parseFloat(arr[0].lon);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-      geoCache.set(q, null);
-      return null;
-    }
-    const result = { lat, lng };
-    geoCache.set(q, result);
-    return result;
-  } catch {
-    geoCache.set(q, null);
-    return null;
-  }
+function isInBBox(
+  p: { lat: number; lng: number },
+  bbox: [number, number, number, number],
+): boolean {
+  const [s, n, w, e] = bbox;
+  return p.lat >= s && p.lat <= n && p.lng >= w && p.lng <= e;
 }
 
-// Pull "可能是地名" tokens out of a query for geocoding fallback.
-//
-// Two-tier strategy:
-//   1) Suffix-anchored matches (XX橋, XX大道, XX路口, XX區, XX市, ...) — high
-//      confidence, place these first so they get geocoded first.
-//   2) If suffix-anchored yields nothing useful, fall back to bare 2-3 char
-//      Chinese sliding-window candidates. Most of those geocode-fail (噪訊),
-//      but place names like "淡水", "三芝", "公館", "西門" 等裸詞會命中。
-//      Caller should cap how many it actually tries against Nominatim.
-function extractLandmarks(q: string): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  const add = (t: string) => {
-    if (t && !seen.has(t)) {
-      seen.add(t);
-      out.push(t);
-    }
-  };
-  // tier 1
-  const suffixed = q.match(
-    /[一-鿿]{2,8}(?:橋|大道|路口|站|捷運|公園|大學|國小|國中|高中|體育場|百貨|車站|區|市|鄉|鎮|縣|路)/g,
-  );
-  suffixed?.forEach(add);
-  // tier 2 — sliding 2-3 char windows over contiguous Chinese chunks.
-  // 2-char first since most TW place names are 2 chars (淡水/三芝/永和/北投/萬華).
-  const chineseChunks = q.match(/[一-鿿]+/g) ?? [];
-  for (let len = 2; len <= 3; len++) {
-    for (const chunk of chineseChunks) {
-      for (let i = 0; i + len <= chunk.length; i++) {
-        add(chunk.slice(i, i + len));
-      }
-    }
-  }
-  return out;
+// ===== retrieval =====
+interface RetrievalResult {
+  points: EnforcementPoint[];
+  mode: string;
+  parsed: ParsedQuery;
+  resolved: ResolvedPlace[];
 }
 
-// ===== relevance pipeline =====
 async function pickRelevantPoints(
   bundle: DataBundle,
   question: string,
   topN = 30,
-): Promise<{ points: EnforcementPoint[]; mode: string }> {
-  const intent = detectIntent(question);
+): Promise<RetrievalResult> {
+  const parsed = parseQuery(question);
   let pool = bundle.points;
-  if (intent.kindFilter) {
-    pool = pool.filter((p) => intent.kindFilter!.includes(p.kind));
+
+  // Intent filter
+  if (parsed.intent.kindFilter) {
+    pool = pool.filter((p) => parsed.intent.kindFilter!.includes(p.kind));
   }
-  if (intent.enforcementTypeContains) {
+  if (parsed.intent.enforcementTypeContains) {
     pool = pool.filter((p) => {
       const et = p.enforcementType ?? "";
-      return intent.enforcementTypeContains!.some((s) => et.includes(s));
+      return parsed.intent.enforcementTypeContains!.some((s) => et.includes(s));
     });
   }
 
-  const expanded = expandQuery(question);
-  const kws = extractKeywords(expanded);
-
-  let scored = pool
-    .map((p) => ({ p, s: scoreRelevance(p, kws) }))
-    .sort((a, b) => b.s - a.s);
-
-  // If keyword search hit nothing, try geocoding extracted landmarks (tier-1
-  // suffix-anchored first, then tier-2 bare 2/3-char chunks) and union by
-  // closest-distance to any successful coord. Cap Nominatim calls so noise
-  // tokens (速嗎, 有測…) don't blow up the latency.
-  if (scored.length === 0 || scored[0].s === 0) {
-    const landmarks = extractLandmarks(question);
-    const coords: Array<{ lat: number; lng: number }> = [];
-    const MAX_GEOCODE_ATTEMPTS = 8;
-    const MAX_HITS = 3;
-    let attempts = 0;
-    for (const lm of landmarks) {
-      if (attempts >= MAX_GEOCODE_ATTEMPTS || coords.length >= MAX_HITS) break;
-      attempts++;
-      const c = await geocodeLandmark(lm);
-      if (c) coords.push(c);
-    }
-    if (coords.length > 0) {
-      scored = pool
-        .map((p) => {
-          let minDist = Infinity;
-          for (const c of coords) minDist = Math.min(minDist, distMeters(c, p));
-          return { p, s: 1 / (1 + minDist / 200) };
-        })
-        .sort((a, b) => b.s - a.s);
-      // only keep points within reasonable distance (3 km)
-      scored = scored.filter((x) => x.s > 1 / (1 + 3000 / 200));
-      if (scored.length > 0) {
-        return {
-          points: scored.slice(0, topN).map((x) => x.p),
-          mode: `geo:${landmarks.join(",")}`,
-        };
-      }
-    }
-    // truly nothing — return empty so the LLM declines politely instead
-    // of dumping random points (which used to surface 金門 due to alphabetical
-    // index order).
-    return { points: [], mode: "empty" };
+  // Road-code filter — if user said "台61" / "國道5", restrict pool to points
+  // whose address actually contains that code.
+  if (parsed.roadCodes.length > 0) {
+    pool = pool.filter((p) => {
+      const blob = `${p.city} ${p.district} ${p.address}`;
+      return parsed.roadCodes.some((rc) => blob.includes(rc));
+    });
   }
 
-  return { points: scored.slice(0, topN).map((x) => x.p), mode: "keyword" };
+  // Resolve geo tokens via Nominatim (sequential due to 1 req/sec policy,
+  // but bounded by max attempts; cache hits cost ~0 time)
+  const resolved: ResolvedPlace[] = [];
+  const MAX_RESOLVE = 6;
+  let attempts = 0;
+  for (const t of parsed.geoTokens) {
+    if (attempts >= MAX_RESOLVE) break;
+    attempts++;
+    const r = await resolveToken(t);
+    resolved.push(...r);
+  }
+
+  // If user gave neither road code nor any resolvable place, we have no
+  // anchor — bail out so the LLM refuses politely instead of dumping points
+  // from somewhere random.
+  if (parsed.roadCodes.length === 0 && resolved.length === 0) {
+    return { points: [], mode: "no-anchor", parsed, resolved };
+  }
+
+  // Score each pool point
+  const scored: Array<{ p: EnforcementPoint; s: number }> = [];
+  for (const p of pool) {
+    let s = 0;
+    // road code substring contributes (filter already enforced membership,
+    // so this is mostly tie-breaking when multiple codes given)
+    const blob = `${p.city} ${p.district} ${p.address}`;
+    for (const rc of parsed.roadCodes) if (blob.includes(rc)) s += 4;
+    // bbox membership
+    for (const r of resolved) {
+      if (r.bbox && isInBBox(p, r.bbox)) s += 5;
+    }
+    // distance to nearest resolved center
+    let minDist = Infinity;
+    for (const r of resolved) {
+      const d = distMeters({ lat: p.lat, lng: p.lng }, r.center);
+      if (d < minDist) minDist = d;
+    }
+    if (minDist < Infinity) {
+      s += 5 / (1 + minDist / 2000); // 2 km falloff; ~5 at 0m, ~1.25 at 6km
+    }
+    // canonical name substring (geographic resolution sometimes returns a
+    // friendly name that may appear in our address)
+    for (const r of resolved) {
+      const lead = r.name.split(",")[0] ?? "";
+      if (lead && blob.includes(lead)) s += 2;
+    }
+    if (s > 0) scored.push({ p, s });
+  }
+  scored.sort((a, b) => b.s - a.s);
+  const top = scored.slice(0, topN).map((x) => x.p);
+
+  return {
+    points: top,
+    mode: `geo:${resolved.length}+road:${parsed.roadCodes.length}+intent:${
+      parsed.intent.kindFilter ? "yes" : "no"
+    }`,
+    parsed,
+    resolved,
+  };
 }
 
 // ===== prompt construction =====
@@ -347,17 +412,17 @@ function formatPoint(p: EnforcementPoint): string {
 
 const SYSTEM_PROMPT = `你是 FlashForce 的查詢助手。FlashForce 是台灣全台科技執法、測速、機動測速的地圖服務。
 
-你會收到使用者問題 + 一份「相關點位」清單（已經過模糊匹配 / 子類過濾 / 地名範圍篩選），務必依以下規則回答：
+你會收到使用者問題 + 一份「相關點位」清單（已經過 intent / 道路代碼 / 地理範圍 篩選），務必依以下規則回答：
 
 1. 用繁體中文，**對話口吻 + 條列**。直接回答問題，不要重複問題。
 2. **列出全部相關點位**（不要只挑一個）。每點開頭加 [id]，方便對照地圖。
-3. 子分類辨識：固定測速、區間測速、闖紅燈、違停、不停讓 等是不同類別 — 答題時要說清楚每點屬於哪一類，不要籠統說「科技執法」。
-4. **絕對不要編造清單裡沒有的欄位**：如果某點清單沒寫速限就不要寫速限；沒寫方向就不要寫方向。誠實回應「速限資訊未提供」。
+3. 子分類辨識：固定測速、區間測速、闖紅燈、違停、不停讓 等是不同類別，要說清楚每點屬於哪一類。
+4. **絕對不要編造清單裡沒有的欄位**：沒寫速限就不要寫；沒寫方向就不要寫。
 5. **絕對不要列出清單以外的點**。每個 [id] 都必須是清單裡實際出現過的。
 6. 如果清單看起來不完全符合題意，誠實說「我看到的清單裡沒有 XX 路 / XX 區的點」，可以附帶提示「附近有以下相關的：...」**前提是清單裡確實有相關項**。
 
 特殊狀況：
-- 清單為空（總共 0 點）→ 回應「資料庫裡沒找到符合的點。可以給更具體的路名 / 行政區 / 路線編號嗎？」**不要編造任何點。**
+- 清單為空（總共 0 點）→ 回應「資料庫沒找到符合的點。請給更具體的路名 / 行政區 / 路線編號。」**不要編造任何點。**
 - 問題明顯跟交通執法、測速、地點查詢無關（食譜、新聞、政治、閒聊）→ 禮貌拒絕：「我只能回答台灣科技執法 / 測速 / 機動測速地圖相關的問題。」**不要附帶任何清單。**
 
 格式：使用 markdown 條列（每行 \`- [id] ...\`），網頁會把 [id] 變成可點的連結。
@@ -371,22 +436,16 @@ A: 仰德大道有 4 個固定測速：
 - [fixed-908] 仰德大道 3 段陽明山國小前
 
 範例輸出 2：
-Q: 台64 區間限速多少
-A: 台64 線上有 3 段區間測速：
-- [tech-19] 東向 21.4K 至 23.2K，速限 70
-- [tech-20] 25.2K 至 28.2K（雙向），速限 70
-- [tech-29] 西向 1.6K 至 5.4K，速限 80
+Q: 西濱新竹段速限多少
+A: 西濱（台61線）新竹段有 X 個測速點：
+- [fixed-XXX] 香山區台61線 XX 公里 速限 100
+- ...
 
 範例輸出 3：
 Q: 給我刺客義大利麵食譜
 A: 我只能回答台灣科技執法 / 測速 / 機動測速地圖相關的問題。`;
 
 // ===== rate limit (per-IP, 2-hour rolling window) =====
-//
-// Module-scope counter — simple but imperfect since CF spawns many isolates;
-// a determined attacker hitting different isolates could exceed the cap.
-// For a personal-use site this is OK; upgrade to KV / Durable Objects if abuse
-// is observed.
 interface IPState {
   count: number;
   resetAt: number;
@@ -394,7 +453,7 @@ interface IPState {
 const ipState = new Map<string, IPState>();
 const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
 const MAX_PER_WINDOW = 30;
-const TURNSTILE_EVERY = 4; // Q4, Q8, Q12, ... require Turnstile
+const TURNSTILE_EVERY = 4;
 
 function getIPState(ip: string): IPState {
   const now = Date.now();
@@ -403,17 +462,14 @@ function getIPState(ip: string): IPState {
     s = { count: 0, resetAt: now + TWO_HOURS_MS };
     ipState.set(ip, s);
   }
-  // basic memory hygiene: cap map size
   if (ipState.size > 5000) {
-    for (const [k, v] of ipState) {
-      if (now > v.resetAt) ipState.delete(k);
-    }
+    for (const [k, v] of ipState) if (now > v.resetAt) ipState.delete(k);
   }
   return s;
 }
 
 async function verifyTurnstile(token: string, env: Env): Promise<boolean> {
-  if (!env.TURNSTILE_SECRET) return true; // gracefully open if not configured
+  if (!env.TURNSTILE_SECRET) return true;
   try {
     const res = await fetch(
       "https://challenges.cloudflare.com/turnstile/v0/siteverify",
@@ -482,7 +538,6 @@ async function handleAsk(req: Request, env: Env): Promise<Response> {
     );
   }
 
-  // Every TURNSTILE_EVERY-th question: require Turnstile token
   const isChallengeRequest =
     turnstileEnabled && (state.count + 1) % TURNSTILE_EVERY === 0;
   if (isChallengeRequest) {
@@ -493,10 +548,7 @@ async function handleAsk(req: Request, env: Env): Promise<Response> {
           sitekey: env.TURNSTILE_SITEKEY,
           message: "請完成驗證後重新送出。",
         }),
-        {
-          status: 401,
-          headers: { "content-type": "application/json" },
-        },
+        { status: 401, headers: { "content-type": "application/json" } },
       );
     }
     const ok = await verifyTurnstile(body.turnstileToken, env);
@@ -507,20 +559,22 @@ async function handleAsk(req: Request, env: Env): Promise<Response> {
           requireTurnstile: true,
           sitekey: env.TURNSTILE_SITEKEY,
         }),
-        {
-          status: 401,
-          headers: { "content-type": "application/json" },
-        },
+        { status: 401, headers: { "content-type": "application/json" } },
       );
     }
   }
 
   const bundle = await getBundle(env, req);
-  const { points: relevant, mode } = await pickRelevantPoints(bundle, question);
+  const { points: relevant, mode, parsed, resolved } = await pickRelevantPoints(
+    bundle,
+    question,
+  );
+
+  const debugLine = `[debug] roadCodes=${JSON.stringify(parsed.roadCodes)} geoTokens=${JSON.stringify(parsed.geoTokens)} resolved=${resolved.map((r) => r.name.split(",")[0]).join(" | ")}`;
 
   const userPrompt =
     relevant.length === 0
-      ? `問題：${question}\n\n相關點位：（清單為空，沒有匹配的點）\n\n請依規則回答。`
+      ? `問題：${question}\n\n相關點位：（清單為空，沒有匹配的點）\n\n${debugLine}\n\n請依規則回答。`
       : `問題：${question}\n\n相關點位（共 ${relevant.length} 點，retrieval mode = ${mode}）：\n${relevant.map(formatPoint).join("\n")}\n\n請依規則回答。`;
 
   const aiResp = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
@@ -534,7 +588,6 @@ async function handleAsk(req: Request, env: Env): Promise<Response> {
 
   const answer = aiResp.response ?? "（模型沒有回應）";
 
-  // Increment counter only on success
   state.count += 1;
 
   return new Response(
