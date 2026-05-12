@@ -703,6 +703,18 @@ const CASES: Case[] = [
   { q: "桃園境內國道3號有幾個", why: "國道3 + 桃園 cityHint; bbox fallback to 桃園 districts", expect: { mode: "roads:國道3" } },
   { q: "新北市的國道1號測速", why: "國道1 + 新北市; bbox fallback to 新北 districts", expect: { mode: "roads:國道1" } },
 
+  // ===== Default UI hint queries (must work cleanly since shown to users) =====
+  {
+    q: "水快測速點位置",
+    why: "alias 水快 → 水源 substr + cities [台北市, 新北市]; should return 水源 entries in those cities, no missing-terms",
+    expect: { allCities: ["台北市", "新北市"], minCount: 2, missing: [] },
+  },
+  {
+    q: "永和區有幾處科技執法",
+    why: "districtHint 永和區 + intent tech; should return 4 tech entries in 永和區",
+    expect: { mode: "kind:tech districts:永和區", allCities: ["新北市"], minCount: 1, minTotalPool: 4 },
+  },
+
   // ===== Verbatim user-typed queries from production failure session =====
   // These are the three queries the user found broken on commit 44fc9ac;
   // adding them verbatim so they remain green and any regression is caught.
